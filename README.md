@@ -1,4 +1,4 @@
-# Metsateatiste süsinikumõju MVP
+# Metsateatiste biomassi süsiniku MVP
 
 Iseseisev Streamlit-rakendus. See **ei sõltu `et-landuse` repost**. Sealt on üle võetud ainult selle MVP jaoks vajalikud süsiniku koefitsiendid ja Metsaregistri detail-API kasutamise loogika.
 
@@ -8,8 +8,10 @@ Rakendus:
 2. filtreerib need valitud ajavahemikku;
 3. leiab metsateatistega kattuvad metsaeraldised;
 4. küsib Metsaregistri detail-API-st ainult nende eraldiste puuliigid, vanuse ja tagavara;
-5. arvutab biomassi süsiniku **puuliikide kaupa**;
-6. kuvab tulemused kaardil, KPI-dena, puuliikide koondina ja tabelis.
+5. arvutab **elusbiomassi süsinikuvaru** ja **kavandatava raiemahu biomassi**
+   puuliikide kaupa ning hoiab need eraldi;
+6. kuvab tulemused koos mahuallika, inventuuri värskuse, ruumilise andmekatte ja
+   jooksva juurdekasvu teabega kaardil, KPI-dena, koondina ja tabelis.
 
 ## Käivitamine
 
@@ -79,12 +81,56 @@ Puidutihedused, mida MVP kasutab:
 
 Kõik ühikud on kooskõlas arvutusega, kus tüvemaht on m³ ja tulemus tonnides CO₂e.
 
+## Tulemuste väljad
+
+`standing_live_biomass_tco2` kirjeldab inventuuri tagavarast hinnatud praegust
+eluspuude biomassi raieteatise ja eraldiste kattel. Selle pindalapõhine paariline on
+`standing_live_biomass_tco2_ha`. `planned_harvest_biomass_tco2` kirjeldab eraldi
+teatises esitatud kavandatava raiemahu biomassi. Kavandatava raiemahu biomass ei
+ole heite ega kliimamõju hinnang ning seda ei asendata puistu praeguse tagavaraga.
+
+Mahu päritolu on alati üks neljast sildist:
+
+- `detail-liigiline tagavara` — elusbiomassi maht pärineb eraldise detailandmete
+  puuliigipõhisest tagavarast;
+- `eraldise tagavara + liigiosakaal` — elusbiomassi maht pärineb eraldise
+  kogutagavarast ja on jaotatud puuliikide osakaalude järgi;
+- `raiemahu põhine hinnang` — kavandatava raiemahu biomass põhineb teatises
+  esitatud raiemahul ja puuliikide osakaaludel;
+- `andmed puuduvad` — vastava mahu arvutamiseks ei olnud piisavalt andmeid.
+
+`standing_volume_basis` ja `planned_harvest_volume_basis` hoiavad kahe hinnangu
+päritolu eraldi. `volume_source_quality` kirjeldab elusbiomassi mahuallikat, mitte
+koondhinnet.
+
+Andmekvaliteet esitatakse sõltumatute mõõtmetena:
+
+- `inventory_date`, `inventory_age_years` ja `inventory_recency` kirjeldavad
+  inventuuri aega. Värskuse klassid on 0–2 aastat `väga hea`, 3–5 `hea`, 6–8
+  `vananev`, 9+ `nõrk` ning puuduva kuupäeva korral `teadmata`;
+- `spatial_coverage_pct` ja `spatial_coverage_quality` kirjeldavad, kui suur osa
+  teatise pindalast on eraldiste inventuuriandmetega kaetud. Piirid on vähemalt
+  90% `hea`, vähemalt 50% `osaline` ja alla 50% `nõrk`;
+- `mean_inventory_age_years` on puuliikide mahu järgi kaalutud keskmine vanus
+  inventuuri hetkel. Liigi inventuurivanust ei segata detailandmetes oleva jooksva
+  vanusega;
+- `current_increment_m3_ha_y` on inventuuri hetkeseisu pindalapõhine jooksev
+  juurdekasv ja `current_increment_on_overlap_m3_y` sama näitaja kattuva ala
+  kohta. `current_increment_coverage_pct` ja `current_increment_is_complete`
+  näitavad, kas juurdekasvu koond on täielik. Puuduvat juurdekasvu ei tõlgendata
+  nullina.
+
+Rakenduse tabel ja CSV kasutavad neid selgeid väljanimesid ega avalda varasemaid
+mitmetähenduslikke koondvälju.
+
 ## Oluline piirang
 
-`carbon_co2e_t` on hinnang **praegu eluspuude biomassis olevale CO₂e-le raiutaval alal**. See ei ole veel lageraie täielik netokliimamõju.
+Rakendus hindab biomassi hetkeseisu ja kavandatud raiemahus sisalduvat biomassi,
+mitte heidet ega kliimamõju. Jooksvat juurdekasvu ei kasutata tulevase tagavara
+ekstrapoleerimiseks, sest üks aastane näitaja ei kirjelda usaldusväärselt kasvu,
+suremust, raiet ega uuenemist ajas.
 
-Järgmine mudeliversioon peaks võrdlema kahte trajektoori:
-- ilma raieta;
-- lageraie + metsauuendus;
-
-ning nende vahet 10/30/50/100 aasta jooksul, lisades vähemalt raiutud puittooted, surnud orgaanilise aine ja mullasüsiniku.
+Trajektooride simulatsioon on seetõttu edasi lükatud eraldi mudelisse. See peab
+võrdlema vähemalt raie puudumist ning raiet koos metsauuendusega 10/30/50/100
+aasta jooksul ja lisama raiutud puittooted, surnud orgaanilise aine ning
+mullasüsiniku.
