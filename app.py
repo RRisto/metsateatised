@@ -18,8 +18,8 @@ from streamlit_folium import st_folium
 from carbon import (
     VolumeBasis,
     aggregate_intersections,
-    carbon_from_species_volume,
     calculate_notice_carbon,
+    carbon_from_species_volume,
     estimate_planned_harvest_volume,
     estimate_standing_volume,
     species_name_for_code,

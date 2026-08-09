@@ -1,8 +1,8 @@
 import pytest
 
 from carbon import (
-    VolumeBasis,
     SpeciesVolume,
+    VolumeBasis,
     calculate_notice_carbon,
     carbon_from_species_volume,
     estimate_planned_harvest_volume,
