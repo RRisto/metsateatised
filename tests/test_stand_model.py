@@ -154,3 +154,19 @@ def test_inventory_recency_bands(years, expected):
 def test_missing_or_invalid_inventory_age_is_not_classified_as_fresh(years):
     """Unknown inventory timing must never be promoted to the strongest recency band."""
     assert classify_inventory_recency(years) == "teadmata"
+
+
+@pytest.mark.parametrize(
+    ("years", "expected"),
+    [
+        (2.999, "väga hea"),
+        (3.0, "hea"),
+        (5.999, "hea"),
+        (6.0, "vananev"),
+        (8.999, "vananev"),
+        (9.0, "nõrk"),
+    ],
+)
+def test_inventory_recency_uses_completed_year_bands(years, expected):
+    """Promoting an inventory before its third, sixth, or ninth anniversary is incorrect."""
+    assert classify_inventory_recency(years) == expected

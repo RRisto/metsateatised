@@ -309,6 +309,8 @@ def analyze(
         out["volume_source_quality"] = VolumeBasis.UNKNOWN.value
         out["current_increment_m3_ha_y"] = np.nan
         out["current_increment_on_overlap_m3_y"] = np.nan
+        out["current_increment_coverage_pct"] = np.nan
+        out["current_increment_is_complete"] = False
         return out.to_crs(4326), pd.DataFrame()
 
     intersections["overlap_ha"] = intersections.geometry.area / 10000
@@ -466,19 +468,18 @@ def analyze(
     inventory_metrics = pd.DataFrame(inventory_metric_rows)
     notice_inventory_metrics = []
     for notice_ix, rows in inventory_metrics.groupby("notice_ix"):
-        known_ages = rows.dropna(subset=["inventory_age_years"])
-        if known_ages.empty:
+        known_ages = rows.dropna(subset=["inventory_age_years", "inventory_date"])
+        if len(known_ages) != len(rows):
             inventory_age_years = np.nan
             inventory_date = None
         else:
-            inventory_age_years = np.average(
-                known_ages["inventory_age_years"], weights=known_ages["overlap_ha"]
-            )
-            inventory_date = known_ages["inventory_date"].min()
+            oldest_inventory = known_ages.loc[known_ages["inventory_date"].idxmin()]
+            inventory_date = oldest_inventory["inventory_date"]
+            inventory_age_years = oldest_inventory["inventory_age_years"]
 
         recency = (
             classify_inventory_recency(inventory_age_years)
-            if len(known_ages) == len(rows)
+            if inventory_date is not None
             else "teadmata"
         )
         increment = aggregate_increment(rows.to_dict("records"))
@@ -490,6 +491,8 @@ def analyze(
                 "inventory_recency": recency,
                 "current_increment_m3_ha_y": increment.current_increment_m3_ha_y,
                 "current_increment_on_overlap_m3_y": increment.current_increment_on_overlap_m3_y,
+                "current_increment_coverage_pct": increment.current_increment_coverage_pct,
+                "current_increment_is_complete": increment.current_increment_is_complete,
             }
         )
     out = out.merge(pd.DataFrame(notice_inventory_metrics), on="notice_ix", how="left")

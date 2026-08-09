@@ -86,6 +86,8 @@ class IncrementAggregate:
 
     current_increment_on_overlap_m3_y: float | None
     current_increment_m3_ha_y: float | None
+    current_increment_coverage_pct: float | None
+    current_increment_is_complete: bool
 
 
 def _finite_float(value: object) -> float | None:
@@ -105,11 +107,11 @@ def classify_inventory_recency(inventory_age_years: float | None) -> str:
     age = _finite_float(inventory_age_years)
     if age is None or age < 0:
         return "teadmata"
-    if age <= 2:
+    if age < 3:
         return "väga hea"
-    if age <= 5:
+    if age < 6:
         return "hea"
-    if age <= 8:
+    if age < 9:
         return "vananev"
     return "nõrk"
 
@@ -130,19 +132,28 @@ def aggregate_increment(rows: Iterable[Mapping[str, object]]) -> IncrementAggreg
     """Aggregate reported current increment by overlap area, never into a trajectory."""
     total_increment_m3_y = 0.0
     increment_area_ha = 0.0
+    total_overlap_ha = 0.0
     for row in rows:
         overlap_ha = _finite_float(row.get("overlap_ha"))
         increment_m3_ha_y = _finite_float(row.get("increment_m3_ha_y"))
-        if overlap_ha is None or overlap_ha <= 0 or increment_m3_ha_y is None:
+        if overlap_ha is None or overlap_ha <= 0:
+            continue
+        total_overlap_ha += overlap_ha
+        if increment_m3_ha_y is None:
             continue
         total_increment_m3_y += increment_m3_ha_y * overlap_ha
         increment_area_ha += overlap_ha
 
-    if increment_area_ha == 0:
-        return IncrementAggregate(None, None)
+    if total_overlap_ha == 0:
+        return IncrementAggregate(None, None, None, False)
+    coverage_pct = 100 * increment_area_ha / total_overlap_ha
+    if increment_area_ha != total_overlap_ha:
+        return IncrementAggregate(None, None, coverage_pct, False)
     return IncrementAggregate(
         current_increment_on_overlap_m3_y=total_increment_m3_y,
         current_increment_m3_ha_y=total_increment_m3_y / increment_area_ha,
+        current_increment_coverage_pct=coverage_pct,
+        current_increment_is_complete=True,
     )
 
 
