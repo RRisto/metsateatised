@@ -7,6 +7,7 @@ from carbon import (
     density_for_species,
     estimate_intersection_from_notice_volume,
     parse_detail,
+    species_name_for_code,
 )
 
 
@@ -84,3 +85,31 @@ def test_notice_volume_is_prorated_across_intersections():
     )
 
     assert allocated[0]["volume_m3"] == 9.0
+
+
+@pytest.mark.parametrize(
+    ("code", "name"),
+    [
+        ("JA", "Jalakas"),
+        ("KD", "Kadakas"),
+        ("LH", "Lehis"),
+        ("PA", "Paju"),
+        ("PI", "Pihlakas"),
+        ("PK", "Paakspuu"),
+        ("PN", "Pärn"),
+        ("PP", "Pappel"),
+        ("RE", "Remmelgas"),
+        ("SP", "Sarapuu"),
+        ("TM", "Toomingas"),
+        ("TO", "Teised okaspuud"),
+        ("TP", "Teised põõsaliigid"),
+        ("VA", "Vaher"),
+        ("0", "Määramata"),
+    ],
+)
+def test_species_codes_have_canonical_names(code, name):
+    assert species_name_for_code(code) == name
+
+
+def test_unknown_species_code_has_readable_fallback():
+    assert species_name_for_code("XY") == "Muu (XY)"

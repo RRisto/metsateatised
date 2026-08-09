@@ -20,6 +20,7 @@ from carbon import (
     carbon_from_species_volume,
     estimate_intersection_from_notice_volume,
     parse_detail,
+    species_name_for_code,
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
@@ -638,6 +639,9 @@ if run:
 if "results" in st.session_state:
     results = st.session_state["results"]
     species_df = st.session_state.get("species_df", pd.DataFrame())
+    if "species_code" in species_df.columns:
+        species_df = species_df.copy()
+        species_df["species"] = species_df["species_code"].apply(species_name_for_code)
     valid = results[results["carbon_co2e_t"].notna()].copy()
 
     c1, c2, c3, c4 = st.columns(4)

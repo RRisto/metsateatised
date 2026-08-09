@@ -14,14 +14,35 @@ WOOD_DENSITY = {
     "TA": 0.58,
 }
 SPECIES_NAMES = {
-    "MA": "Mänd",
-    "KU": "Kuusk",
-    "KS": "Kask",
+    "0": "Määramata",
     "HB": "Haab",
+    "JA": "Jalakas",
+    "KD": "Kadakas",
+    "KP": "Künnapuu",
+    "KS": "Kask",
+    "KU": "Kuusk",
+    "LH": "Lehis",
     "LM": "Sanglepp",
     "LV": "Hall lepp",
+    "MA": "Mänd",
+    "NU": "Nulg",
+    "PA": "Paju",
+    "PI": "Pihlakas",
+    "PK": "Paakspuu",
+    "PN": "Pärn",
+    "PP": "Pappel",
+    "RE": "Remmelgas",
     "SA": "Saar",
+    "SD": "Seedermänd",
+    "SP": "Sarapuu",
     "TA": "Tamm",
+    "TL": "Teised lehtpuud",
+    "TM": "Toomingas",
+    "TO": "Teised okaspuud",
+    "TP": "Teised põõsaliigid",
+    "TS": "Ebatsuuga",
+    "TY": "Türnpuu",
+    "VA": "Vaher",
 }
 DEFAULT_WOOD_DENSITY = 0.42
 CARBON_FRACTION = 0.50
@@ -55,6 +76,13 @@ def density_for_species(code: str | None) -> float:
     if code is None:
         return DEFAULT_WOOD_DENSITY
     return WOOD_DENSITY.get(str(code).strip().upper(), DEFAULT_WOOD_DENSITY)
+
+
+def species_name_for_code(code: str | None) -> str:
+    if code is None or not str(code).strip():
+        return "Muu"
+    normalized_code = str(code).strip().upper()
+    return SPECIES_NAMES.get(normalized_code, f"Muu ({normalized_code})")
 
 
 def carbon_from_species_volume(volume_m3: float, species_code: str | None) -> float:
@@ -120,9 +148,7 @@ def parse_detail(detail: dict) -> dict:
         species_rows.append(
             {
                 "species_code": species,
-                "species_name": SPECIES_NAMES.get(
-                    str(species).upper(), str(species) if species else "Muu"
-                ),
+                "species_name": species_name_for_code(species),
                 "volume_m3_ha": None if pd.isna(volume_ha) else float(volume_ha),
                 "share": None if pd.isna(share) else float(share),
                 "age": None if pd.isna(age) else float(age),
