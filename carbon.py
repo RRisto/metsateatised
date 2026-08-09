@@ -180,14 +180,17 @@ def _allocate_by_weights(
 def _allocate_by_shares(
     total_volume_m3: float, species: tuple[SpeciesRecord, ...]
 ) -> tuple[SpeciesVolume, ...]:
+    if not species or any(
+        item.share_pct is None or not isfinite(item.share_pct) or item.share_pct < 0
+        for item in species
+    ):
+        return ()
     return _allocate_by_weights(
         total_volume_m3,
         tuple(
             (item, item.share_pct)
             for item in species
-            if _is_living_stock_record(item)
-            and item.share_pct is not None
-            and isfinite(item.share_pct)
+            if _is_living_stock_record(item) and item.share_pct is not None
         ),
     )
 
@@ -258,6 +261,41 @@ def _allocate_wfs_species(
     return allocations or None
 
 
+def _allocate_detail_strata_by_shares(
+    total_volume_m3: float, detail_species: tuple[SpeciesRecord, ...]
+) -> tuple[SpeciesVolume, ...]:
+    """Weight strata by stock, then species by local share; stock is the local fallback."""
+    species_by_stratum: dict[str | None, list[SpeciesRecord]] = {}
+    for item in detail_species:
+        species_by_stratum.setdefault(item.stratum_code, []).append(item)
+
+    stratum_weights = {
+        stratum: sum(item.stock_m3_ha for item in items)
+        for stratum, items in species_by_stratum.items()
+    }
+    total_weight = sum(stratum_weights.values())
+    if total_weight <= 0:
+        return ()
+
+    allocations = []
+    for stratum, items in species_by_stratum.items():
+        stratum_weight = stratum_weights[stratum]
+        if stratum_weight <= 0:
+            continue
+        stratum_volume = total_volume_m3 * stratum_weight / total_weight
+        local_species = tuple(items)
+        local_allocations = _allocate_by_shares(stratum_volume, local_species)
+        if not local_allocations:
+            local_allocations = _allocate_by_weights(
+                stratum_volume,
+                tuple((item, item.stock_m3_ha) for item in local_species),
+            )
+        if not local_allocations:
+            return ()
+        allocations.extend(local_allocations)
+    return tuple(allocations)
+
+
 def estimate_standing_volume(stand: StandRecord, overlap_ha: float) -> StandingVolumeEstimate:
     """Estimate standing stock from inventory sources, never a notice harvest quantity."""
     if not isfinite(overlap_ha) or overlap_ha <= 0:
@@ -308,34 +346,31 @@ def estimate_planned_harvest_volume(
 
     allocation = ()
     if stand is not None:
-        detail_species = _complete_detail_species(stand)
-        if detail_species is not None:
+        wfs_species = _allocate_wfs_species(stand, 1.0)
+        if wfs_species is not None:
             allocation = _allocate_by_weights(
                 notice_volume_m3,
-                tuple((item, item.stock_m3_ha) for item in detail_species),
+                tuple(
+                    (
+                        SpeciesRecord(
+                            item.species_code,
+                            species_name_for_code(item.species_code),
+                            None,
+                            None,
+                            item.inventory_age,
+                            item.current_age,
+                            item.source_record_id,
+                            item.stratum_code,
+                        ),
+                        item.volume_m3,
+                    )
+                    for item in wfs_species
+                ),
             )
         else:
-            wfs_species = _allocate_wfs_species(stand, 1.0)
-            if wfs_species is not None:
-                allocation = _allocate_by_weights(
-                    notice_volume_m3,
-                    tuple(
-                        (
-                            SpeciesRecord(
-                                item.species_code,
-                                species_name_for_code(item.species_code),
-                                None,
-                                None,
-                                item.inventory_age,
-                                item.current_age,
-                                item.source_record_id,
-                                item.stratum_code,
-                            ),
-                            item.volume_m3,
-                        )
-                        for item in wfs_species
-                    ),
-                )
+            detail_species = _complete_detail_species(stand)
+            if detail_species is not None:
+                allocation = _allocate_detail_strata_by_shares(notice_volume_m3, detail_species)
         if not allocation and stand.stock_m3_ha is None:
             living_species = tuple(item for item in stand.species if _is_living_stock_record(item))
             living_strata = {
@@ -349,13 +384,10 @@ def estimate_planned_harvest_volume(
         complete_stock = living_species and all(
             item.stock_m3_ha is not None for item in living_species
         )
-        if complete_stock:
-            allocation = _allocate_by_weights(
-                notice_volume_m3,
-                tuple((item, item.stock_m3_ha) for item in living_species),
-            )
-        elif len({item.stratum_code for item in living_species if item.stratum_code}) <= 1:
+        if len({item.stratum_code for item in living_species if item.stratum_code}) <= 1:
             allocation = _allocate_by_shares(notice_volume_m3, living_species)
+        if not allocation and complete_stock:
+            allocation = _allocate_detail_strata_by_shares(notice_volume_m3, living_species)
 
     return StandingVolumeEstimate(
         VolumeBasis.NOTICE_HARVEST_VOLUME,

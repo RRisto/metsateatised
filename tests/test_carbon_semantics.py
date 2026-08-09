@@ -205,8 +205,8 @@ REAL_MULTI_STRATUM_DETAIL = {
 }
 
 
-def test_real_schema_multistratum_planned_volume_uses_detail_stock_not_pooled_shares():
-    """Pooling two independently normalized strata would overallocate the duplicate KU rows."""
+def test_real_schema_multistratum_planned_volume_uses_stratum_local_shares():
+    """Species stock rounding must not replace each living stratum's declared shares."""
     stand = build_stand_record(
         REAL_MULTI_STRATUM_WFS,
         REAL_MULTI_STRATUM_DETAIL,
@@ -224,8 +224,164 @@ def test_real_schema_multistratum_planned_volume_uses_detail_stock_not_pooled_sh
         20048897,
     ]
     assert [row.volume_m3 for row in estimate.species_volumes] == pytest.approx(
-        [100 * 123 / 244, 100 * 71 / 244, 100 * 25 / 244, 100 * 9 / 244, 100 * 16 / 244]
+        [
+            100 * 228 / 244 * 0.54,
+            100 * 228 / 244 * 0.31,
+            100 * 228 / 244 * 0.11,
+            100 * 228 / 244 * 0.04,
+            100 * 16 / 244,
+        ]
     )
+
+
+def test_real_schema_rounded_zero_stock_keeps_nonzero_local_share():
+    """The 5% hornbeam share in live stand 11870644 must survive rounded zero stock."""
+    stand = build_stand_record(
+        {"id": 11870644, "tagavara_1_ha": 2, "tagavara_2_ha": None, "tagavara_y_ha": 5},
+        {
+            "elemendid": [
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "1",
+                    "puuliigiKood": "KS",
+                    "paritoluKood": "S",
+                    "osakaal": 95,
+                    "vanus": 12,
+                    "aasta": 2013,
+                    "korgus": 4.0,
+                    "diameeter": 2,
+                    "gSumma": 0.5,
+                    "tagavara": 2,
+                    "arv": 1710,
+                    "enamus": True,
+                    "mahtTm": 4.26,
+                    "jooksevVanus": 13,
+                    "id": 39615354,
+                },
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "1",
+                    "puuliigiKood": "HB",
+                    "paritoluKood": "V",
+                    "osakaal": 5,
+                    "vanus": 12,
+                    "aasta": 2013,
+                    "korgus": 4.0,
+                    "diameeter": 2,
+                    "gSumma": 0.0,
+                    "tagavara": 0,
+                    "arv": 90,
+                    "enamus": False,
+                    "mahtTm": 0.0,
+                    "jooksevVanus": 13,
+                    "id": 39615355,
+                },
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "Y",
+                    "puuliigiKood": "MA",
+                    "paritoluKood": "S",
+                    "osakaal": 75,
+                    "vanus": 95,
+                    "aasta": 1930,
+                    "korgus": 16.0,
+                    "diameeter": 26,
+                    "gSumma": 0.5,
+                    "tagavara": 4,
+                    "arv": 9,
+                    "enamus": False,
+                    "mahtTm": 8.52,
+                    "jooksevVanus": 96,
+                    "id": 39615356,
+                },
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "Y",
+                    "puuliigiKood": "KS",
+                    "paritoluKood": "S",
+                    "osakaal": 25,
+                    "vanus": 35,
+                    "aasta": 1990,
+                    "korgus": 10.0,
+                    "diameeter": 9,
+                    "gSumma": 0.3,
+                    "tagavara": 1,
+                    "arv": 47,
+                    "enamus": False,
+                    "mahtTm": 2.13,
+                    "jooksevVanus": 36,
+                    "id": 39615357,
+                },
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "A",
+                    "puuliigiKood": "PK",
+                    "korgus": 2.0,
+                    "enamus": False,
+                    "id": 39615358,
+                },
+                {
+                    "eraldisId": 11870644,
+                    "rindeKood": "A",
+                    "puuliigiKood": "PA",
+                    "korgus": 2.0,
+                    "enamus": False,
+                    "id": 39615359,
+                },
+            ]
+        },
+        as_of_date=date(2026, 8, 9),
+    )
+
+    estimate = estimate_planned_harvest_volume(100.0, stand=stand)
+
+    assert estimate.is_complete is True
+    assert [row.source_record_id for row in estimate.species_volumes] == [
+        39615354,
+        39615355,
+        39615356,
+        39615357,
+    ]
+    assert [row.volume_m3 for row in estimate.species_volumes] == pytest.approx(
+        [
+            100 * 2 / 7 * 0.95,
+            100 * 2 / 7 * 0.05,
+            100 * 5 / 7 * 0.75,
+            100 * 5 / 7 * 0.25,
+        ]
+    )
+
+
+def test_planned_local_share_gap_falls_back_to_complete_record_stock():
+    """A missing local share must trigger stock fallback instead of renormalizing other shares."""
+    stand = build_stand_record(
+        {"id": 1},
+        {
+            "elemendid": [
+                {
+                    "id": 11,
+                    "rindeKood": "1",
+                    "puuliigiKood": "MA",
+                    "osakaal": None,
+                    "tagavara": 50,
+                },
+                {
+                    "id": 12,
+                    "rindeKood": "1",
+                    "puuliigiKood": "KS",
+                    "osakaal": 100,
+                    "tagavara": 50,
+                },
+            ]
+        },
+        as_of_date=date(2026, 8, 9),
+    )
+
+    estimate = estimate_planned_harvest_volume(100.0, stand=stand)
+
+    assert estimate.is_complete is True
+    assert [row.source_record_id for row in estimate.species_volumes] == [11, 12]
+    assert [row.volume_m3 for row in estimate.species_volumes] == pytest.approx([50, 50])
 
 
 def test_incomplete_detail_stock_falls_back_to_matching_wfs_strata():

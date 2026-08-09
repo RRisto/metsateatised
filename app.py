@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 from carbon import (
@@ -199,6 +200,25 @@ def normalize_stand_id(value):
         return str(value)
 
 
+def _positive_area_polygonal_part(geometry):
+    if geometry is None or geometry.is_empty:
+        return None
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        polygonal = geometry
+    elif geometry.geom_type == "GeometryCollection":
+        parts = [
+            part
+            for item in geometry.geoms
+            if (part := _positive_area_polygonal_part(item)) is not None
+        ]
+        polygonal = unary_union(parts) if parts else None
+    else:
+        polygonal = None
+    if polygonal is None or polygonal.area <= INTERSECTION_AREA_TOLERANCE_M2:
+        return None
+    return polygonal
+
+
 async def _fetch_detail_one(session: aiohttp.ClientSession, stand_id) -> dict | None:
     cached = read_json_cache(
         "details",
@@ -293,11 +313,8 @@ def analyze(
         how="intersection",
         keep_geom_type=False,
     )
-    intersection_area_m2 = intersections.geometry.area
-    polygonal = intersections.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
-    intersections = intersections.loc[
-        polygonal & (intersection_area_m2 > INTERSECTION_AREA_TOLERANCE_M2)
-    ].copy()
+    intersections["geometry"] = intersections.geometry.apply(_positive_area_polygonal_part)
+    intersections = intersections.loc[intersections.geometry.notna()].copy()
 
     if intersections.empty:
         out = n.copy()

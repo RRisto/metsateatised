@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import geopandas as gpd
 import pandas as pd
 import pytest
-from shapely.geometry import box
+from shapely.geometry import MultiPolygon, box
 
 import app
 from carbon import VolumeBasis
@@ -258,6 +258,56 @@ def test_analyze_excludes_boundary_neighbour_from_mixed_inventory_metrics(monkey
     assert row.inventory_date == overlap_date
     assert row.current_increment_m3_ha_y == 4.0
     assert row.current_increment_coverage_pct == 100.0
+
+
+def test_analyze_retains_polygon_area_inside_geometry_collection(monkeypatch):
+    """A boundary line beside a real polygon overlap must not discard the polygon area."""
+    inventory_date = date(2025, 1, 1)
+    notices = gpd.GeoDataFrame(
+        {"teatis_id": [1]},
+        geometry=[
+            MultiPolygon(
+                [
+                    box(500000, 6500000, 500200, 6500200),
+                    box(500300, 6500000, 500400, 6500100),
+                ]
+            )
+        ],
+        crs="EPSG:3301",
+    )
+    stands = gpd.GeoDataFrame(
+        [_stand_row(1, inventory_date, 4.0)],
+        geometry=[box(500100, 6500000, 500300, 6500200)],
+        crs="EPSG:3301",
+    )
+    fetched_ids = []
+
+    def fetch_details(stand_ids, **_kwargs):
+        fetched_ids.extend(stand_ids)
+        return [
+            {
+                "_stand_id": 1,
+                "elemendid": [
+                    {
+                        "id": 11,
+                        "rindeKood": "1",
+                        "puuliigiKood": "KS",
+                        "osakaal": 100,
+                        "tagavara": 30,
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(app, "fetch_stand_details", fetch_details)
+
+    result, _ = app.analyze(notices, stands)
+    row = result.iloc[0]
+
+    assert fetched_ids == [1]
+    assert row.spatial_coverage_pct == pytest.approx(40.0)
+    assert row.inventory_date == inventory_date
+    assert pd.notna(row.standing_live_biomass_tco2)
 
 
 def test_analyze_weights_duplicate_species_ages_by_source_record(monkeypatch):
