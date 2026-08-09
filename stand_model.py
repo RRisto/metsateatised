@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from math import isfinite
+from types import MappingProxyType
 
 SPECIES_NAMES = {
     "0": "Määramata",
@@ -48,6 +49,20 @@ def species_name_for_code(code: str | None) -> str:
     return SPECIES_NAMES.get(normalized_code, f"Muu ({normalized_code})")
 
 
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
+
+
+def _immutable_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({str(key): _freeze_value(value) for key, value in values.items()})
+
+
 @dataclass(frozen=True)
 class SpeciesRecord:
     code: str | None
@@ -56,6 +71,12 @@ class SpeciesRecord:
     stock_m3_ha: float | None
     inventory_age: float | None
     current_age: float | None
+    record_id: int | str | None = None
+    stratum_code: str | None = None
+    raw_fields: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "raw_fields", _immutable_mapping(self.raw_fields))
 
 
 @dataclass(frozen=True)
@@ -68,8 +89,8 @@ class StandRecord:
     area_ha: float | None
     height_m: float | None
     stock_m3_ha: float | None
-    raw_stock_components_m3_ha: dict[str, float]
-    raw_stock_component_inputs: dict[str, object]
+    raw_stock_components_m3_ha: Mapping[str, float]
+    raw_stock_component_inputs: Mapping[str, object]
     current_increment_m3_ha_y: float | None
     basal_area_m2_ha: float | None
     stocking_pct: float | None
@@ -79,6 +100,19 @@ class StandRecord:
     development_class: str | None
     species: tuple[SpeciesRecord, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "raw_stock_components_m3_ha",
+            _immutable_mapping(self.raw_stock_components_m3_ha),
+        )
+        object.__setattr__(
+            self,
+            "raw_stock_component_inputs",
+            _immutable_mapping(self.raw_stock_component_inputs),
+        )
+        object.__setattr__(self, "species", tuple(self.species))
+
 
 @dataclass(frozen=True)
 class IncrementAggregate:
@@ -86,6 +120,7 @@ class IncrementAggregate:
 
     current_increment_on_overlap_m3_y: float | None
     current_increment_m3_ha_y: float | None
+    current_increment_covered_area_ha: float
     current_increment_coverage_pct: float | None
     current_increment_is_complete: bool
 
@@ -145,13 +180,14 @@ def aggregate_increment(rows: Iterable[Mapping[str, object]]) -> IncrementAggreg
         increment_area_ha += overlap_ha
 
     if total_overlap_ha == 0:
-        return IncrementAggregate(None, None, None, False)
+        return IncrementAggregate(None, None, 0.0, None, False)
     coverage_pct = 100 * increment_area_ha / total_overlap_ha
     if increment_area_ha != total_overlap_ha:
-        return IncrementAggregate(None, None, coverage_pct, False)
+        return IncrementAggregate(None, None, increment_area_ha, coverage_pct, False)
     return IncrementAggregate(
         current_increment_on_overlap_m3_y=total_increment_m3_y,
         current_increment_m3_ha_y=total_increment_m3_y / increment_area_ha,
+        current_increment_covered_area_ha=increment_area_ha,
         current_increment_coverage_pct=coverage_pct,
         current_increment_is_complete=True,
     )
@@ -198,6 +234,27 @@ def _date(value: object) -> date | None:
             return None
 
 
+def _anniversary(source: date, year: int) -> date:
+    try:
+        return source.replace(year=year)
+    except ValueError:
+        return date(year, 2, 28)
+
+
+def _calendar_age_years(inventory_date: date, as_of_date: date) -> float:
+    if as_of_date < inventory_date:
+        return -_calendar_age_years(as_of_date, inventory_date)
+
+    completed_years = as_of_date.year - inventory_date.year
+    anniversary = _anniversary(inventory_date, inventory_date.year + completed_years)
+    if anniversary > as_of_date:
+        completed_years -= 1
+        anniversary = _anniversary(inventory_date, inventory_date.year + completed_years)
+    next_anniversary = _anniversary(inventory_date, inventory_date.year + completed_years + 1)
+    fraction = (as_of_date - anniversary).days / (next_anniversary - anniversary).days
+    return completed_years + fraction
+
+
 def _bool(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -225,12 +282,17 @@ def _detail_elements(detail: Mapping[str, object] | None) -> Iterable[Mapping[st
 def normalize_species_records(detail: Mapping[str, object] | None) -> tuple[SpeciesRecord, ...]:
     """Normalize the per-species elements supplied by a detail response."""
     records = []
-    for element in _detail_elements(detail):
+    for index, element in enumerate(_detail_elements(detail)):
         stock = _finite_float(element.get("tagavara"))
         if stock is not None and stock < 0:
             continue
         code = _text(element.get("puuliigiKood"))
         normalized_code = code.upper() if code is not None else None
+        record_id = _integer(element.get("id")) or _text(element.get("id"))
+        if record_id is None:
+            stand_id = _text(element.get("eraldisId")) or "unknown"
+            record_id = f"{stand_id}:{index}"
+        stratum_code = _text(element.get("rindeKood"))
         records.append(
             SpeciesRecord(
                 code=normalized_code,
@@ -239,6 +301,9 @@ def normalize_species_records(detail: Mapping[str, object] | None) -> tuple[Spec
                 stock_m3_ha=stock,
                 inventory_age=_finite_float(element.get("vanus")),
                 current_age=_finite_float(element.get("jooksevVanus")),
+                record_id=record_id,
+                stratum_code=stratum_code.upper() if stratum_code is not None else None,
+                raw_fields=element,
             )
         )
     return tuple(records)
@@ -252,7 +317,7 @@ def build_stand_record(
     """Merge a WFS stand row and its optional detail response into one typed record."""
     inventory_date = _date(wfs_row.get("invent_kp"))
     inventory_age_years = (
-        (as_of_date - inventory_date).days / 365.25 if inventory_date is not None else None
+        _calendar_age_years(inventory_date, as_of_date) if inventory_date is not None else None
     )
 
     stock_components = {}

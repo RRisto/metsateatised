@@ -133,6 +133,71 @@ def test_build_stand_record_excludes_invalid_stock_components():
     }
 
 
+def test_normalization_preserves_real_stratum_identity_and_raw_fields_immutably():
+    """Dropping or mutating source metadata would make multi-stratum allocation unauditable."""
+    raw_element = {
+        "eraldisId": 6522173,
+        "rindeKood": "2",
+        "puuliigiKood": "KU",
+        "paritoluKood": "S",
+        "osakaal": 100,
+        "vanus": 81,
+        "aasta": 1932,
+        "korgus": 15.0,
+        "diameeter": 14,
+        "gSumma": 0.0,
+        "tagavara": 16,
+        "arv": 130,
+        "enamus": False,
+        "mahtTm": 19.2,
+        "jooksevVanus": 94,
+        "id": 20048897,
+    }
+
+    record = normalize_species_records({"elemendid": [raw_element]})[0]
+
+    assert record.record_id == 20048897
+    assert record.stratum_code == "2"
+    assert record.raw_fields == raw_element
+    with pytest.raises(TypeError):
+        record.raw_fields["tagavara"] = 999
+
+
+def test_stand_record_stock_audit_mappings_are_immutable():
+    """A frozen stand must not expose mutable dictionaries that alter its audit trail."""
+    stand = build_stand_record(WFS_STAND, DETAIL, as_of_date=date(2026, 8, 9))
+
+    with pytest.raises(TypeError):
+        stand.raw_stock_components_m3_ha["layer_1"] = 999
+    with pytest.raises(TypeError):
+        stand.raw_stock_component_inputs["tagavara_1_ha"] = 999
+
+
+@pytest.mark.parametrize(
+    ("inventory_date", "as_of_date", "expected_years", "expected_recency"),
+    [
+        (date(2020, 8, 9), date(2023, 8, 9), 3.0, "hea"),
+        (date(2020, 8, 9), date(2026, 8, 9), 6.0, "vananev"),
+        (date(2017, 8, 9), date(2026, 8, 9), 9.0, "nõrk"),
+        (date(2020, 2, 29), date(2023, 2, 28), 3.0, "hea"),
+        (date(2020, 2, 29), date(2026, 2, 28), 6.0, "vananev"),
+        (date(2020, 2, 29), date(2029, 2, 28), 9.0, "nõrk"),
+    ],
+)
+def test_build_stand_record_uses_calendar_anniversaries_for_recency(
+    inventory_date, as_of_date, expected_years, expected_recency
+):
+    """Day-count division must not delay recency bands past calendar anniversaries."""
+    stand = build_stand_record(
+        {**WFS_STAND, "invent_kp": inventory_date.isoformat()},
+        DETAIL,
+        as_of_date=as_of_date,
+    )
+
+    assert stand.inventory_age_years == expected_years
+    assert classify_inventory_recency(stand.inventory_age_years) == expected_recency
+
+
 @pytest.mark.parametrize(
     ("years", "expected"),
     [

@@ -43,9 +43,7 @@ def test_notice_3973677_has_stand_and_planned_harvest_inputs():
     detail = response.json()
     detail["_stand_id"] = stand_id
     stand = build_stand_record(stand_properties, detail, as_of_date=date.today())
-    planned = estimate_planned_harvest_volume(
-        notice_volume_m3=notice["raiutav_maht"], species=stand.species
-    )
+    planned = estimate_planned_harvest_volume(notice_volume_m3=notice["raiutav_maht"], stand=stand)
     carbon = calculate_notice_carbon(
         standing_species_volumes=(),
         planned_harvest_species_volumes=planned.species_volumes,

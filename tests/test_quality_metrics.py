@@ -115,7 +115,7 @@ def test_analyze_exposes_independent_quality_and_complete_increment_metrics(monk
     assert row.spatial_coverage_pct == pytest.approx(50.0)
     assert row.spatial_coverage_quality == "osaline"
     assert row.inventory_recency == "väga hea"
-    assert row.volume_source_quality == VolumeBasis.DETAIL_SPECIES_STOCK.value
+    assert row.volume_source_quality == VolumeBasis.WFS_STAND_STOCK_ALLOCATED.value
     assert row.current_increment_m3_ha_y == pytest.approx(4.0)
     assert row.current_increment_on_overlap_m3_y == pytest.approx(8.0)
     assert row.current_increment_coverage_pct == pytest.approx(100.0)
@@ -167,17 +167,12 @@ def test_analyze_uses_oldest_inventory_for_age_and_marks_partial_increment(monke
     assert row.inventory_date == oldest_date
     assert row.inventory_age_years == pytest.approx((today - oldest_date).days / 365.25)
     assert row.inventory_recency == "hea"
-    assert row.volume_source_quality == " + ".join(
-        [
-            VolumeBasis.DETAIL_SPECIES_STOCK.value,
-            VolumeBasis.WFS_STAND_STOCK_ALLOCATED.value,
-        ]
-    )
+    assert row.volume_source_quality == VolumeBasis.WFS_STAND_STOCK_ALLOCATED.value
     assert pd.isna(row.current_increment_on_overlap_m3_y)
     assert pd.isna(row.current_increment_m3_ha_y)
     assert row.current_increment_coverage_pct == pytest.approx(50.0)
     assert bool(row.current_increment_is_complete) is False
-    assert row.mean_current_age_years == pytest.approx(68.0)
+    assert row.mean_current_age_years == pytest.approx(65.0)
 
 
 def test_analyze_no_intersection_exposes_unknown_inventory_dimensions():
@@ -199,3 +194,131 @@ def test_analyze_no_intersection_exposes_unknown_inventory_dimensions():
     assert pd.isna(row.mean_current_age_years)
     assert pd.isna(row.current_increment_m3_ha_y)
     assert pd.isna(row.current_increment_on_overlap_m3_y)
+
+
+def test_analyze_ignores_boundary_only_intersections_before_detail_fetch(monkeypatch):
+    """A line-only touch must follow the no-intersection path and fetch no stand detail."""
+    notices, stands = _notices_and_stands(
+        stand_rows=[_stand_row(2, date(2020, 1, 1), 9.0)],
+        stand_geometries=[box(500200, 6500000, 500300, 6500200)],
+    )
+
+    def unexpected_fetch(*_args, **_kwargs):
+        pytest.fail("boundary-only stand detail must not be fetched")
+
+    monkeypatch.setattr(app, "fetch_stand_details", unexpected_fetch)
+
+    result, species = app.analyze(notices, stands)
+    row = result.iloc[0]
+
+    assert species.empty
+    assert row.spatial_coverage_pct == 0.0
+    assert row.inventory_date is None
+    assert row.inventory_recency == "teadmata"
+
+
+def test_analyze_excludes_boundary_neighbour_from_mixed_inventory_metrics(monkeypatch):
+    """A zero-area neighbour must not contaminate a real overlap's dates or completeness."""
+    overlap_date = date(2025, 1, 1)
+    notices, stands = _notices_and_stands(
+        stand_rows=[
+            _stand_row(1, overlap_date, 4.0),
+            _stand_row(2, date(2010, 1, 1), None),
+        ],
+        stand_geometries=[
+            box(500000, 6500000, 500100, 6500200),
+            box(500200, 6500000, 500300, 6500200),
+        ],
+    )
+    fetched_ids = []
+
+    def fetch_details(stand_ids, **_kwargs):
+        fetched_ids.extend(stand_ids)
+        return [
+            {
+                "_stand_id": 1,
+                "elemendid": [
+                    {
+                        "id": 11,
+                        "rindeKood": "1",
+                        "puuliigiKood": "KS",
+                        "osakaal": 100,
+                        "tagavara": 30,
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(app, "fetch_stand_details", fetch_details)
+
+    result, _ = app.analyze(notices, stands)
+    row = result.iloc[0]
+
+    assert fetched_ids == [1]
+    assert row.inventory_date == overlap_date
+    assert row.current_increment_m3_ha_y == 4.0
+    assert row.current_increment_coverage_pct == 100.0
+
+
+def test_analyze_weights_duplicate_species_ages_by_source_record(monkeypatch):
+    """Joining ages by species code would assign the second-layer KU age to both KU rows."""
+    notices, stands = _notices_and_stands(
+        stand_rows=[
+            {
+                **_stand_row(6522173, date(2012, 1, 1), 3.0),
+                "tagavara_1_ha": 228,
+                "tagavara_2_ha": 16,
+                "tagavara_y_ha": 0,
+            }
+        ],
+        stand_geometries=[box(500000, 6500000, 500200, 6500200)],
+    )
+    detail_rows = [
+        (20048903, "1", "KU", 54, 123, 178, 191),
+        (20048901, "1", "MA", 31, 71, 178, 191),
+        (20048905, "1", "KS", 11, 25, 148, 161),
+        (20048899, "1", "HB", 4, 9, 148, 161),
+        (20048897, "2", "KU", 100, 16, 81, 94),
+    ]
+    monkeypatch.setattr(
+        app,
+        "fetch_stand_details",
+        lambda *_args, **_kwargs: [
+            {
+                "_stand_id": 6522173,
+                "elemendid": [
+                    {
+                        "id": record_id,
+                        "eraldisId": 6522173,
+                        "rindeKood": stratum,
+                        "puuliigiKood": species,
+                        "osakaal": share,
+                        "tagavara": stock,
+                        "vanus": inventory_age,
+                        "jooksevVanus": current_age,
+                    }
+                    for (
+                        record_id,
+                        stratum,
+                        species,
+                        share,
+                        stock,
+                        inventory_age,
+                        current_age,
+                    ) in detail_rows
+                ],
+            }
+        ],
+    )
+
+    result, species = app.analyze(notices, stands)
+    row = result.iloc[0]
+
+    assert row.mean_age == pytest.approx(
+        (123 * 178 + 71 * 178 + 25 * 148 + 9 * 148 + 16 * 81) / 244
+    )
+    assert row.mean_current_age_years == pytest.approx(
+        (123 * 191 + 71 * 191 + 25 * 161 + 9 * 161 + 16 * 94) / 244
+    )
+    ku_rows = species[(species["estimate_scope"] == "standing") & (species["species_code"] == "KU")]
+    assert list(ku_rows["age"]) == [178, 81]

@@ -29,8 +29,11 @@ def dashboard_result_fixture():
             "inventory_recency": ["hea"],
             "current_increment_m3_ha_y": [7.4],
             "current_increment_on_overlap_m3_y": [17.8],
+            "current_increment_covered_area_ha": [2.4],
             "current_increment_coverage_pct": [100.0],
             "current_increment_is_complete": [True],
+            "standing_biomass_is_complete": [True],
+            "planned_harvest_biomass_is_complete": [True],
         },
         geometry=[Polygon([(24.47, 58.75), (24.48, 58.75), (24.48, 58.76)])],
         crs="EPSG:4326",
@@ -114,6 +117,8 @@ def test_export_schema_is_explicit_and_excludes_legacy_aggregates():
         "planned_harvest_biomass_tco2",
         "standing_volume_basis",
         "planned_harvest_volume_basis",
+        "standing_biomass_is_complete",
+        "planned_harvest_biomass_is_complete",
         "inventory_date",
         "inventory_age_years",
         "inventory_recency",
@@ -122,6 +127,7 @@ def test_export_schema_is_explicit_and_excludes_legacy_aggregates():
         "volume_source_quality",
         "current_increment_m3_ha_y",
         "current_increment_on_overlap_m3_y",
+        "current_increment_covered_area_ha",
         "current_increment_coverage_pct",
         "current_increment_is_complete",
     ]
@@ -139,3 +145,28 @@ def test_map_popup_keeps_biomass_quantities_and_sources_separate():
     assert "Kavandatava raiemahu biomass: 120 t CO₂e" in rendered_map
     assert "Elusbiomassi mahu alus: eraldise tagavara + liigiosakaal" in rendered_map
     assert "Kavandatava raiemahu alus: raiemahu põhine hinnang" in rendered_map
+
+
+def test_dashboard_increment_caption_uses_area_weighted_rate():
+    """Averaging notice-level rates equally would contradict the displayed total increment."""
+    results = gpd.GeoDataFrame(
+        pd.concat([dashboard_result_fixture(), dashboard_result_fixture()], ignore_index=True),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    results["teatis_id"] = [1, 2]
+    results["area_ha"] = [1.0, 3.0]
+    results["current_increment_m3_ha_y"] = [4.0, 8.0]
+    results["current_increment_on_overlap_m3_y"] = [4.0, 24.0]
+    results["current_increment_covered_area_ha"] = [1.0, 3.0]
+
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.session_state["results"] = results
+    app.session_state["species_df"] = pd.DataFrame()
+
+    app.run(timeout=20)
+
+    assert not app.exception
+    rendered_text = _rendered_text(app)
+    assert "7.0 m³/ha/a" in rendered_text
+    assert "28.0 m³/a" in rendered_text

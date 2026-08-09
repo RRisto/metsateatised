@@ -44,6 +44,7 @@ LAYERS = {
     "archive_notices": "metsaregister:teatis_arhiiv",
     "stands": "metsaregister:eraldis",
 }
+INTERSECTION_AREA_TOLERANCE_M2 = 1e-6
 
 st.set_page_config(page_title="Metsateatiste biomassi süsinik MVP", layout="wide")
 
@@ -292,6 +293,11 @@ def analyze(
         how="intersection",
         keep_geom_type=False,
     )
+    intersection_area_m2 = intersections.geometry.area
+    polygonal = intersections.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    intersections = intersections.loc[
+        polygonal & (intersection_area_m2 > INTERSECTION_AREA_TOLERANCE_M2)
+    ].copy()
 
     if intersections.empty:
         out = n.copy()
@@ -303,6 +309,8 @@ def analyze(
         out["mean_current_age_years"] = np.nan
         out["standing_volume_basis"] = VolumeBasis.UNKNOWN.value
         out["planned_harvest_volume_basis"] = VolumeBasis.UNKNOWN.value
+        out["standing_biomass_is_complete"] = False
+        out["planned_harvest_biomass_is_complete"] = False
         out["spatial_coverage_pct"] = 0.0
         out["spatial_coverage_quality"] = "nõrk"
         out["inventory_date"] = None
@@ -311,6 +319,7 @@ def analyze(
         out["volume_source_quality"] = VolumeBasis.UNKNOWN.value
         out["current_increment_m3_ha_y"] = np.nan
         out["current_increment_on_overlap_m3_y"] = np.nan
+        out["current_increment_covered_area_ha"] = 0.0
         out["current_increment_coverage_pct"] = np.nan
         out["current_increment_is_complete"] = False
         return out.to_crs(4326), pd.DataFrame()
@@ -356,10 +365,10 @@ def analyze(
                 float(notice_volume)
                 * float(row["overlap_ha"])
                 / total_overlap_by_notice[row["notice_ix"]],
-                stand.species,
+                stand=stand,
             )
         else:
-            planned_harvest_volume = estimate_planned_harvest_volume(-1.0, stand.species)
+            planned_harvest_volume = estimate_planned_harvest_volume(float("nan"), stand=stand)
 
         carbon = calculate_notice_carbon(
             standing_species_volumes=standing_volume.species_volumes,
@@ -369,36 +378,36 @@ def analyze(
         age_den = 0.0
         current_age_num = 0.0
         current_age_den = 0.0
-        species_by_code = {species.code: species for species in stand.species}
         for estimate_scope, species_volumes in (
             ("standing", standing_volume.species_volumes),
             ("planned_harvest", planned_harvest_volume.species_volumes),
         ):
             for species_volume in species_volumes:
-                species = species_by_code.get(species_volume.species_code)
                 species_carbon = carbon_from_species_volume(
                     species_volume.volume_m3,
                     species_volume.species_code,
                 )
-                if estimate_scope == "standing" and species and species.inventory_age is not None:
-                    age_num += species.inventory_age * species_volume.volume_m3
+                if estimate_scope == "standing" and species_volume.inventory_age is not None:
+                    age_num += species_volume.inventory_age * species_volume.volume_m3
                     age_den += species_volume.volume_m3
-                if estimate_scope == "standing" and species and species.current_age is not None:
-                    current_age_num += species.current_age * species_volume.volume_m3
+                if estimate_scope == "standing" and species_volume.current_age is not None:
+                    current_age_num += species_volume.current_age * species_volume.volume_m3
                     current_age_den += species_volume.volume_m3
 
                 species_breakdown_rows.append(
                     {
                         "notice_ix": row["notice_ix"],
                         "stand_id": sid,
+                        "source_record_id": species_volume.source_record_id,
+                        "stratum_code": species_volume.stratum_code,
                         "estimate_scope": estimate_scope,
                         "species_code": species_volume.species_code,
                         "species": species_name_for_code(species_volume.species_code),
                         "overlap_ha": row["overlap_ha"],
                         "volume_m3": species_volume.volume_m3,
                         "biomass_tco2": species_carbon,
-                        "age": species.inventory_age if species else None,
-                        "current_age": species.current_age if species else None,
+                        "age": species_volume.inventory_age,
+                        "current_age": species_volume.current_age,
                         "site_class": stand.site_class,
                         "site_type": stand.site_type,
                         "drained": stand.drained,
@@ -413,6 +422,8 @@ def analyze(
                 "planned_harvest_biomass_tco2": carbon.planned_harvest_biomass_tco2,
                 "standing_volume_basis": standing_volume.basis.value,
                 "planned_harvest_volume_basis": planned_harvest_volume.basis.value,
+                "standing_biomass_is_complete": standing_volume.is_complete,
+                "planned_harvest_biomass_is_complete": planned_harvest_volume.is_complete,
                 "weighted_age_num": age_num,
                 "weighted_age_den": age_den,
                 "weighted_current_age_num": current_age_num,
@@ -510,6 +521,7 @@ def analyze(
                 "inventory_recency": recency,
                 "current_increment_m3_ha_y": increment.current_increment_m3_ha_y,
                 "current_increment_on_overlap_m3_y": increment.current_increment_on_overlap_m3_y,
+                "current_increment_covered_area_ha": (increment.current_increment_covered_area_ha),
                 "current_increment_coverage_pct": increment.current_increment_coverage_pct,
                 "current_increment_is_complete": increment.current_increment_is_complete,
             }
@@ -547,6 +559,8 @@ def build_export_table(results: pd.DataFrame) -> pd.DataFrame:
         "planned_harvest_biomass_tco2",
         "standing_volume_basis",
         "planned_harvest_volume_basis",
+        "standing_biomass_is_complete",
+        "planned_harvest_biomass_is_complete",
         "inventory_date",
         "inventory_age_years",
         "inventory_recency",
@@ -555,6 +569,7 @@ def build_export_table(results: pd.DataFrame) -> pd.DataFrame:
         "volume_source_quality",
         "current_increment_m3_ha_y",
         "current_increment_on_overlap_m3_y",
+        "current_increment_covered_area_ha",
         "current_increment_coverage_pct",
         "current_increment_is_complete",
     ]
@@ -797,16 +812,40 @@ if "results" in st.session_state:
         f"värskus: {inventory_recency or 'teadmata'}"
     )
 
-    increment_rates = results["current_increment_m3_ha_y"].dropna()
-    increment_totals = results["current_increment_on_overlap_m3_y"].dropna()
+    increment_complete = results.get(
+        "current_increment_is_complete",
+        results["current_increment_on_overlap_m3_y"].notna(),
+    ).astype(bool)
+    increment_totals = pd.to_numeric(results["current_increment_on_overlap_m3_y"], errors="coerce")
+    increment_areas = pd.to_numeric(
+        results.get("current_increment_covered_area_ha"), errors="coerce"
+    )
+    compatible_increment = (
+        increment_complete
+        & np.isfinite(increment_totals)
+        & np.isfinite(increment_areas)
+        & (increment_areas > 0)
+    )
+    dashboard_increment_total = increment_totals.loc[compatible_increment].sum(min_count=1)
+    dashboard_increment_area = increment_areas.loc[compatible_increment].sum(min_count=1)
+    dashboard_increment_rate = (
+        dashboard_increment_total / dashboard_increment_area
+        if pd.notna(dashboard_increment_total)
+        and pd.notna(dashboard_increment_area)
+        and dashboard_increment_area > 0
+        else np.nan
+    )
     st.caption(
         "Jooksev juurdekasv: "
-        f"{fmt_num(increment_rates.mean(), 1) if len(increment_rates) else '–'} m³/ha/a · "
-        f"{fmt_num(increment_totals.sum(), 1) if len(increment_totals) else '–'} m³/a"
+        f"{fmt_num(dashboard_increment_rate, 1)} m³/ha/a · "
+        f"{fmt_num(dashboard_increment_total, 1)} m³/a"
     )
 
     harvest_estimates = (
-        results["planned_harvest_volume_basis"].eq(VolumeBasis.NOTICE_HARVEST_VOLUME.value).sum()
+        results["planned_harvest_volume_basis"]
+        .astype(str)
+        .str.contains(VolumeBasis.NOTICE_HARVEST_VOLUME.value, regex=False)
+        .sum()
     )
     if harvest_estimates:
         st.info(
