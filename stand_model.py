@@ -80,6 +80,14 @@ class StandRecord:
     species: tuple[SpeciesRecord, ...]
 
 
+@dataclass(frozen=True)
+class IncrementAggregate:
+    """Present-state increment totals for the inventory-covered overlap only."""
+
+    current_increment_on_overlap_m3_y: float | None
+    current_increment_m3_ha_y: float | None
+
+
 def _finite_float(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -90,6 +98,52 @@ def _finite_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if isfinite(number) else None
+
+
+def classify_inventory_recency(inventory_age_years: float | None) -> str:
+    """Classify inventory age using the documented project recency bands."""
+    age = _finite_float(inventory_age_years)
+    if age is None or age < 0:
+        return "teadmata"
+    if age <= 2:
+        return "väga hea"
+    if age <= 5:
+        return "hea"
+    if age <= 8:
+        return "vananev"
+    return "nõrk"
+
+
+def classify_spatial_coverage(spatial_coverage_pct: float | None) -> str:
+    """Classify inventory spatial coverage without combining it with other dimensions."""
+    coverage = _finite_float(spatial_coverage_pct)
+    if coverage is None:
+        return "teadmata"
+    if coverage >= 90:
+        return "hea"
+    if coverage >= 50:
+        return "osaline"
+    return "nõrk"
+
+
+def aggregate_increment(rows: Iterable[Mapping[str, object]]) -> IncrementAggregate:
+    """Aggregate reported current increment by overlap area, never into a trajectory."""
+    total_increment_m3_y = 0.0
+    increment_area_ha = 0.0
+    for row in rows:
+        overlap_ha = _finite_float(row.get("overlap_ha"))
+        increment_m3_ha_y = _finite_float(row.get("increment_m3_ha_y"))
+        if overlap_ha is None or overlap_ha <= 0 or increment_m3_ha_y is None:
+            continue
+        total_increment_m3_y += increment_m3_ha_y * overlap_ha
+        increment_area_ha += overlap_ha
+
+    if increment_area_ha == 0:
+        return IncrementAggregate(None, None)
+    return IncrementAggregate(
+        current_increment_on_overlap_m3_y=total_increment_m3_y,
+        current_increment_m3_ha_y=total_increment_m3_y / increment_area_ha,
+    )
 
 
 def _integer(value: object) -> int | None:

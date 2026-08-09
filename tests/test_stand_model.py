@@ -4,7 +4,11 @@ from datetime import date
 
 import pytest
 
-from stand_model import build_stand_record, normalize_species_records
+from stand_model import (
+    build_stand_record,
+    classify_inventory_recency,
+    normalize_species_records,
+)
 
 WFS_STAND = {
     "id": "12148722",
@@ -127,3 +131,26 @@ def test_build_stand_record_excludes_invalid_stock_components():
         "tagavara_2_ha": -2,
         "tagavara_y_ha": "7",
     }
+
+
+@pytest.mark.parametrize(
+    ("years", "expected"),
+    [
+        (0.0, "väga hea"),
+        (2.0, "väga hea"),
+        (3.0, "hea"),
+        (5.0, "hea"),
+        (6.0, "vananev"),
+        (8.0, "vananev"),
+        (9.0, "nõrk"),
+    ],
+)
+def test_inventory_recency_bands(years, expected):
+    """Changing a recency threshold would misrepresent inventory freshness."""
+    assert classify_inventory_recency(years) == expected
+
+
+@pytest.mark.parametrize("years", [None, float("nan"), -0.1])
+def test_missing_or_invalid_inventory_age_is_not_classified_as_fresh(years):
+    """Unknown inventory timing must never be promoted to the strongest recency band."""
+    assert classify_inventory_recency(years) == "teadmata"

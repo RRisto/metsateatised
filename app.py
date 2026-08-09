@@ -26,7 +26,12 @@ from carbon import (
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
-from stand_model import build_stand_record
+from stand_model import (
+    aggregate_increment,
+    build_stand_record,
+    classify_inventory_recency,
+    classify_spatial_coverage,
+)
 from wfs import fetch_wfs_features
 
 # -----------------------------------------------------------------------------
@@ -296,7 +301,14 @@ def analyze(
         out["planned_harvest_biomass_tco2"] = np.nan
         out["standing_volume_basis"] = VolumeBasis.UNKNOWN.value
         out["planned_harvest_volume_basis"] = VolumeBasis.UNKNOWN.value
-        out["data_quality"] = "Puistuandmeid ei leitud"
+        out["spatial_coverage_pct"] = 0.0
+        out["spatial_coverage_quality"] = "nõrk"
+        out["inventory_date"] = None
+        out["inventory_age_years"] = np.nan
+        out["inventory_recency"] = "teadmata"
+        out["volume_source_quality"] = VolumeBasis.UNKNOWN.value
+        out["current_increment_m3_ha_y"] = np.nan
+        out["current_increment_on_overlap_m3_y"] = np.nan
         return out.to_crs(4326), pd.DataFrame()
 
     intersections["overlap_ha"] = intersections.geometry.area / 10000
@@ -325,6 +337,7 @@ def analyze(
 
     species_breakdown_rows = []
     intersection_rows = []
+    inventory_metric_rows = []
     for _, row in intersections.iterrows():
         sid = row["_join_stand_id"]
         stand_row = stand_rows_by_ix[int(row["stand_ix"])]
@@ -394,6 +407,15 @@ def analyze(
                 "weighted_age_den": age_den,
             }
         )
+        inventory_metric_rows.append(
+            {
+                "notice_ix": row["notice_ix"],
+                "overlap_ha": float(row["overlap_ha"]),
+                "inventory_date": stand.inventory_date,
+                "inventory_age_years": stand.inventory_age_years,
+                "increment_m3_ha_y": stand.current_increment_m3_ha_y,
+            }
+        )
 
     agg = aggregate_intersections(intersection_rows)
     if agg.empty:
@@ -424,7 +446,7 @@ def analyze(
 
     out = n.merge(agg, on="notice_ix", how="left")
     out["area_ha"] = out.geometry.area / 10000
-    out["inventory_coverage_pct"] = (
+    out["spatial_coverage_pct"] = (
         100 * out["covered_by_inventory_ha"] / out["area_ha"].replace(0, np.nan)
     )
     out["standing_live_biomass_tco2_ha"] = out["standing_live_biomass_tco2"] / out[
@@ -436,14 +458,41 @@ def analyze(
     out["planned_harvest_volume_basis"] = out["planned_harvest_volume_basis"].fillna(
         VolumeBasis.UNKNOWN.value
     )
-    out["data_quality"] = np.select(
-        [
-            out["inventory_coverage_pct"] >= 90,
-            out["inventory_coverage_pct"] >= 50,
-        ],
-        ["hea", "osaline"],
-        default="nõrk",
+    out["spatial_coverage_quality"] = out["spatial_coverage_pct"].apply(
+        classify_spatial_coverage
     )
+    out["volume_source_quality"] = out["standing_volume_basis"]
+
+    inventory_metrics = pd.DataFrame(inventory_metric_rows)
+    notice_inventory_metrics = []
+    for notice_ix, rows in inventory_metrics.groupby("notice_ix"):
+        known_ages = rows.dropna(subset=["inventory_age_years"])
+        if known_ages.empty:
+            inventory_age_years = np.nan
+            inventory_date = None
+        else:
+            inventory_age_years = np.average(
+                known_ages["inventory_age_years"], weights=known_ages["overlap_ha"]
+            )
+            inventory_date = known_ages["inventory_date"].min()
+
+        recency = (
+            classify_inventory_recency(inventory_age_years)
+            if len(known_ages) == len(rows)
+            else "teadmata"
+        )
+        increment = aggregate_increment(rows.to_dict("records"))
+        notice_inventory_metrics.append(
+            {
+                "notice_ix": notice_ix,
+                "inventory_date": inventory_date,
+                "inventory_age_years": inventory_age_years,
+                "inventory_recency": recency,
+                "current_increment_m3_ha_y": increment.current_increment_m3_ha_y,
+                "current_increment_on_overlap_m3_y": increment.current_increment_on_overlap_m3_y,
+            }
+        )
+    out = out.merge(pd.DataFrame(notice_inventory_metrics), on="notice_ix", how="left")
     return out.to_crs(4326), species_df
 
 
