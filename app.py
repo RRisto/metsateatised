@@ -16,14 +16,17 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 from carbon import (
+    VolumeBasis,
     aggregate_intersections,
     carbon_from_species_volume,
-    estimate_intersection_from_notice_volume,
-    parse_detail,
+    calculate_notice_carbon,
+    estimate_planned_harvest_volume,
+    estimate_standing_volume,
     species_name_for_code,
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
+from stand_model import build_stand_record
 from wfs import fetch_wfs_features
 
 # -----------------------------------------------------------------------------
@@ -288,8 +291,11 @@ def analyze(
     if intersections.empty:
         out = n.copy()
         out["area_ha"] = out.geometry.area / 10000
-        out["carbon_co2e_t"] = np.nan
-        out["calculation_basis"] = "andmed puuduvad"
+        out["standing_live_biomass_tco2"] = np.nan
+        out["standing_live_biomass_tco2_ha"] = np.nan
+        out["planned_harvest_biomass_tco2"] = np.nan
+        out["standing_volume_basis"] = VolumeBasis.UNKNOWN.value
+        out["planned_harvest_volume_basis"] = VolumeBasis.UNKNOWN.value
         out["data_quality"] = "Puistuandmeid ei leitud"
         return out.to_crs(4326), pd.DataFrame()
 
@@ -301,8 +307,11 @@ def analyze(
         stand_ids,
         progress_callback=detail_progress_callback,
     )
-    parsed = [parse_detail(d) for d in details_raw]
-    detail_by_id = {normalize_stand_id(d["stand_id"]): d for d in parsed}
+    detail_by_id = {normalize_stand_id(d["_stand_id"]): d for d in details_raw}
+    stand_rows_by_ix = {
+        int(stand_ix): stand_row.to_dict()
+        for stand_ix, stand_row in s.set_index("stand_ix").iterrows()
+    }
 
     notice_volume_col = first_matching_column(
         n.columns, ["raiutav_maht", "raie_maht", "harvest_volume"]
@@ -316,99 +325,71 @@ def analyze(
 
     species_breakdown_rows = []
     intersection_rows = []
-    harvest_volume_notice_ids = set()
-
     for _, row in intersections.iterrows():
         sid = row["_join_stand_id"]
-        detail = detail_by_id.get(sid)
-        if not detail or not detail["species_rows"]:
-            intersection_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "overlap_ha": row["overlap_ha"],
-                    "stem_volume_m3": np.nan,
-                    "carbon_co2e_t": np.nan,
-                    "weighted_age_num": 0.0,
-                    "weighted_age_den": 0.0,
-                }
-            )
-            continue
+        stand_row = stand_rows_by_ix[int(row["stand_ix"])]
+        if "id" not in stand_row:
+            stand_row["id"] = stand_row[stand_id_col]
+        stand = build_stand_record(stand_row, detail_by_id.get(sid), as_of_date=date.today())
+        standing_volume = estimate_standing_volume(stand, float(row["overlap_ha"]))
 
-        species_with_estimates = []
-        rows_with_inventory_volume = [
-            sp for sp in detail["species_rows"] if sp["volume_m3_ha"] is not None
-        ]
-        if rows_with_inventory_volume:
-            for sp in rows_with_inventory_volume:
-                stem_m3 = sp["volume_m3_ha"] * row["overlap_ha"]
-                species_with_estimates.append(
-                    {
-                        **sp,
-                        "volume_m3": stem_m3,
-                        "carbon_co2e_t": carbon_from_species_volume(stem_m3, sp["species_code"]),
-                    }
-                )
+        notice_volume = notice_volume_by_ix.get(row["notice_ix"])
+        if pd.notna(notice_volume):
+            planned_harvest_volume = estimate_planned_harvest_volume(
+                float(notice_volume)
+                * float(row["overlap_ha"])
+                / total_overlap_by_notice[row["notice_ix"]],
+                stand.species,
+            )
         else:
-            notice_volume = notice_volume_by_ix.get(row["notice_ix"])
-            if pd.notna(notice_volume):
-                species_with_estimates = estimate_intersection_from_notice_volume(
-                    notice_volume_m3=float(notice_volume),
-                    overlap_ha=row["overlap_ha"],
-                    total_overlap_ha=total_overlap_by_notice[row["notice_ix"]],
-                    species_rows=detail["species_rows"],
-                )
-            if species_with_estimates:
-                harvest_volume_notice_ids.add(row["notice_ix"])
+            planned_harvest_volume = estimate_planned_harvest_volume(-1.0, stand.species)
 
-        if not species_with_estimates:
-            intersection_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "overlap_ha": row["overlap_ha"],
-                    "stem_volume_m3": np.nan,
-                    "carbon_co2e_t": np.nan,
-                    "weighted_age_num": 0.0,
-                    "weighted_age_den": 0.0,
-                }
-            )
-            continue
-
-        total_stem = 0.0
-        total_carbon = 0.0
+        carbon = calculate_notice_carbon(
+            standing_species_volumes=standing_volume.species_volumes,
+            planned_harvest_species_volumes=planned_harvest_volume.species_volumes,
+        )
         age_num = 0.0
         age_den = 0.0
+        species_by_code = {species.code: species for species in stand.species}
+        for estimate_scope, species_volumes in (
+            ("standing", standing_volume.species_volumes),
+            ("planned_harvest", planned_harvest_volume.species_volumes),
+        ):
+            for species_volume in species_volumes:
+                species = species_by_code.get(species_volume.species_code)
+                species_carbon = carbon_from_species_volume(
+                    species_volume.volume_m3,
+                    species_volume.species_code,
+                )
+                if estimate_scope == "standing" and species and species.inventory_age is not None:
+                    age_num += species.inventory_age * species_volume.volume_m3
+                    age_den += species_volume.volume_m3
 
-        for sp in species_with_estimates:
-            stem_m3 = sp["volume_m3"]
-            carbon = sp["carbon_co2e_t"]
-            total_stem += stem_m3
-            total_carbon += carbon
-            if sp["age"] is not None:
-                age_num += sp["age"] * stem_m3
-                age_den += stem_m3
-
-            species_breakdown_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "stand_id": sid,
-                    "species_code": sp["species_code"],
-                    "species": sp["species_name"],
-                    "overlap_ha": row["overlap_ha"],
-                    "volume_m3": stem_m3,
-                    "carbon_co2e_t": carbon,
-                    "age": sp["age"],
-                    "site_class": detail["site_class"],
-                    "site_type": detail["site_type"],
-                    "drained": detail["drained"],
-                }
-            )
+                species_breakdown_rows.append(
+                    {
+                        "notice_ix": row["notice_ix"],
+                        "stand_id": sid,
+                        "estimate_scope": estimate_scope,
+                        "species_code": species_volume.species_code,
+                        "species": species_name_for_code(species_volume.species_code),
+                        "overlap_ha": row["overlap_ha"],
+                        "volume_m3": species_volume.volume_m3,
+                        "biomass_tco2": species_carbon,
+                        "age": species.inventory_age if species else None,
+                        "site_class": stand.site_class,
+                        "site_type": stand.site_type,
+                        "drained": stand.drained,
+                    }
+                )
 
         intersection_rows.append(
             {
                 "notice_ix": row["notice_ix"],
                 "overlap_ha": row["overlap_ha"],
-                "stem_volume_m3": total_stem,
-                "carbon_co2e_t": total_carbon,
+                "standing_live_biomass_tco2": carbon.standing_live_biomass_tco2,
+                "planned_harvest_biomass_tco2": carbon.planned_harvest_biomass_tco2,
+                "standing_volume_basis": standing_volume.basis.value,
+                "planned_harvest_volume_basis": planned_harvest_volume.basis.value,
                 "weighted_age_num": age_num,
                 "weighted_age_den": age_den,
             }
@@ -420,13 +401,25 @@ def analyze(
 
     species_df = pd.DataFrame(species_breakdown_rows)
     if not species_df.empty:
+        species_df["scope_rank"] = species_df["estimate_scope"].eq("planned_harvest")
         dom = (
-            species_df.groupby(["notice_ix", "species"], as_index=False)["volume_m3"]
+            species_df.groupby(["notice_ix", "estimate_scope", "species"], as_index=False)[
+                "volume_m3"
+            ]
             .sum()
-            .sort_values(["notice_ix", "volume_m3"], ascending=[True, False])
+            .merge(
+                species_df[["notice_ix", "estimate_scope", "scope_rank"]].drop_duplicates(),
+                on=["notice_ix", "estimate_scope"],
+                how="left",
+            )
+            .sort_values(
+                ["notice_ix", "scope_rank", "volume_m3"],
+                ascending=[True, True, False],
+            )
             .drop_duplicates("notice_ix")
             .rename(columns={"species": "dominant_species"})[["notice_ix", "dominant_species"]]
         )
+        species_df = species_df.drop(columns="scope_rank")
         agg = agg.merge(dom, on="notice_ix", how="left")
 
     out = n.merge(agg, on="notice_ix", how="left")
@@ -434,22 +427,21 @@ def analyze(
     out["inventory_coverage_pct"] = (
         100 * out["covered_by_inventory_ha"] / out["area_ha"].replace(0, np.nan)
     )
-    out["carbon_t_per_ha"] = out["carbon_co2e_t"] / out["area_ha"].replace(0, np.nan)
-    out["calculation_basis"] = np.select(
-        [
-            out["notice_ix"].isin(harvest_volume_notice_ids),
-            out["carbon_co2e_t"].notna(),
-        ],
-        ["raiemahu põhine hinnang", "inventuuri tagavara"],
-        default="andmed puuduvad",
+    out["standing_live_biomass_tco2_ha"] = out["standing_live_biomass_tco2"] / out[
+        "area_ha"
+    ].replace(0, np.nan)
+    out["standing_volume_basis"] = out["standing_volume_basis"].fillna(
+        VolumeBasis.UNKNOWN.value
+    )
+    out["planned_harvest_volume_basis"] = out["planned_harvest_volume_basis"].fillna(
+        VolumeBasis.UNKNOWN.value
     )
     out["data_quality"] = np.select(
         [
-            out["notice_ix"].isin(harvest_volume_notice_ids),
             out["inventory_coverage_pct"] >= 90,
             out["inventory_coverage_pct"] >= 50,
         ],
-        ["raiemahu põhine", "hea", "osaline"],
+        ["hea", "osaline"],
         default="nõrk",
     )
     return out.to_crs(4326), species_df

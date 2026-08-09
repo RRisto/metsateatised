@@ -51,17 +51,36 @@ class StandingVolumeEstimate:
     species_volumes: tuple[SpeciesVolume, ...]
 
 
+@dataclass(frozen=True)
+class NoticeCarbonEstimate:
+    """Independent biomass estimates for inventory state and a planned harvest."""
+
+    standing_live_biomass_tco2: float | None
+    planned_harvest_biomass_tco2: float | None
+
+
 def aggregate_intersections(intersection_rows: list[dict]) -> pd.DataFrame:
     """Aggregate stand intersections while preserving unknown estimates."""
     intersections = pd.DataFrame(intersection_rows)
     if intersections.empty:
         return intersections
 
+    def combined_basis(values: pd.Series) -> str:
+        return " + ".join(sorted({str(value) for value in values if pd.notna(value)}))
+
     aggregated = intersections.groupby("notice_ix", as_index=False).agg(
-        carbon_co2e_t=("carbon_co2e_t", lambda values: values.sum(min_count=1)),
-        estimated_stem_volume_m3=(
-            "stem_volume_m3",
+        standing_live_biomass_tco2=(
+            "standing_live_biomass_tco2",
             lambda values: values.sum(min_count=1),
+        ),
+        planned_harvest_biomass_tco2=(
+            "planned_harvest_biomass_tco2",
+            lambda values: values.sum(min_count=1),
+        ),
+        standing_volume_basis=("standing_volume_basis", combined_basis),
+        planned_harvest_volume_basis=(
+            "planned_harvest_volume_basis",
+            combined_basis,
         ),
         covered_by_inventory_ha=("overlap_ha", "sum"),
         weighted_age_num=("weighted_age_num", "sum"),
@@ -157,6 +176,27 @@ def carbon_from_species_volume(volume_m3: float, species_code: str | None) -> fl
     total_biomass_t = dry_stem_t * BEF
     carbon_t = total_biomass_t * CARBON_FRACTION
     return carbon_t * CO2_PER_C
+
+
+def calculate_notice_carbon(
+    *,
+    standing_species_volumes: list[SpeciesVolume] | tuple[SpeciesVolume, ...],
+    planned_harvest_species_volumes: list[SpeciesVolume] | tuple[SpeciesVolume, ...],
+) -> NoticeCarbonEstimate:
+    """Calculate standing and planned-harvest biomass without combining their meanings."""
+
+    def carbon_total(species_volumes: list[SpeciesVolume] | tuple[SpeciesVolume, ...]):
+        if not species_volumes:
+            return None
+        return sum(
+            carbon_from_species_volume(item.volume_m3, item.species_code)
+            for item in species_volumes
+        )
+
+    return NoticeCarbonEstimate(
+        standing_live_biomass_tco2=carbon_total(standing_species_volumes),
+        planned_harvest_biomass_tco2=carbon_total(planned_harvest_species_volumes),
+    )
 
 
 def allocate_volume_by_species(total_volume_m3: float, species_rows: list[dict]) -> list[dict]:

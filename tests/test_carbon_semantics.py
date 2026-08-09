@@ -2,6 +2,9 @@ import pytest
 
 from carbon import (
     VolumeBasis,
+    SpeciesVolume,
+    calculate_notice_carbon,
+    carbon_from_species_volume,
     estimate_planned_harvest_volume,
     estimate_standing_volume,
 )
@@ -84,3 +87,19 @@ def test_planned_harvest_volume_is_separate_and_carries_its_own_basis():
     assert [row.volume_m3 for row in estimate.species_volumes] == pytest.approx(
         [14.4, 1.8, 0.9, 0.9]
     )
+
+
+def test_partial_harvest_keeps_standing_and_planned_harvest_separate():
+    """Combining the estimates would make planned harvesting look like standing biomass."""
+    result = calculate_notice_carbon(
+        standing_species_volumes=[SpeciesVolume("KU", 100.0)],
+        planned_harvest_species_volumes=[SpeciesVolume("KU", 40.0)],
+    )
+
+    assert result.standing_live_biomass_tco2 == pytest.approx(
+        carbon_from_species_volume(100, "KU")
+    )
+    assert result.planned_harvest_biomass_tco2 == pytest.approx(
+        carbon_from_species_volume(40, "KU")
+    )
+    assert result.planned_harvest_biomass_tco2 < result.standing_live_biomass_tco2
