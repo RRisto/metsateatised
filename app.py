@@ -13,17 +13,26 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 from carbon import (
+    VolumeBasis,
     aggregate_intersections,
+    calculate_notice_carbon,
     carbon_from_species_volume,
-    estimate_intersection_from_notice_volume,
-    parse_detail,
+    estimate_planned_harvest_volume,
+    estimate_standing_volume,
     species_name_for_code,
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
+from stand_model import (
+    aggregate_increment,
+    build_stand_record,
+    classify_inventory_recency,
+    classify_spatial_coverage,
+)
 from wfs import fetch_wfs_features
 
 # -----------------------------------------------------------------------------
@@ -36,8 +45,9 @@ LAYERS = {
     "archive_notices": "metsaregister:teatis_arhiiv",
     "stands": "metsaregister:eraldis",
 }
+INTERSECTION_AREA_TOLERANCE_M2 = 1e-6
 
-st.set_page_config(page_title="Metsateatiste süsinikumõju MVP", layout="wide")
+st.set_page_config(page_title="Metsateatiste biomassi süsinik MVP", layout="wide")
 
 
 def _clean_col(s: str) -> str:
@@ -190,6 +200,25 @@ def normalize_stand_id(value):
         return str(value)
 
 
+def _positive_area_polygonal_part(geometry):
+    if geometry is None or geometry.is_empty:
+        return None
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        polygonal = geometry
+    elif geometry.geom_type == "GeometryCollection":
+        parts = [
+            part
+            for item in geometry.geoms
+            if (part := _positive_area_polygonal_part(item)) is not None
+        ]
+        polygonal = unary_union(parts) if parts else None
+    else:
+        polygonal = None
+    if polygonal is None or polygonal.area <= INTERSECTION_AREA_TOLERANCE_M2:
+        return None
+    return polygonal
+
+
 async def _fetch_detail_one(session: aiohttp.ClientSession, stand_id) -> dict | None:
     cached = read_json_cache(
         "details",
@@ -284,13 +313,32 @@ def analyze(
         how="intersection",
         keep_geom_type=False,
     )
+    intersections["geometry"] = intersections.geometry.apply(_positive_area_polygonal_part)
+    intersections = intersections.loc[intersections.geometry.notna()].copy()
 
     if intersections.empty:
         out = n.copy()
         out["area_ha"] = out.geometry.area / 10000
-        out["carbon_co2e_t"] = np.nan
-        out["calculation_basis"] = "andmed puuduvad"
-        out["data_quality"] = "Puistuandmeid ei leitud"
+        out["standing_live_biomass_tco2"] = np.nan
+        out["standing_live_biomass_tco2_ha"] = np.nan
+        out["planned_harvest_biomass_tco2"] = np.nan
+        out["mean_age"] = np.nan
+        out["mean_current_age_years"] = np.nan
+        out["standing_volume_basis"] = VolumeBasis.UNKNOWN.value
+        out["planned_harvest_volume_basis"] = VolumeBasis.UNKNOWN.value
+        out["standing_biomass_is_complete"] = False
+        out["planned_harvest_biomass_is_complete"] = False
+        out["spatial_coverage_pct"] = 0.0
+        out["spatial_coverage_quality"] = "nõrk"
+        out["inventory_date"] = None
+        out["inventory_age_years"] = np.nan
+        out["inventory_recency"] = "teadmata"
+        out["volume_source_quality"] = VolumeBasis.UNKNOWN.value
+        out["current_increment_m3_ha_y"] = np.nan
+        out["current_increment_on_overlap_m3_y"] = np.nan
+        out["current_increment_covered_area_ha"] = 0.0
+        out["current_increment_coverage_pct"] = np.nan
+        out["current_increment_is_complete"] = False
         return out.to_crs(4326), pd.DataFrame()
 
     intersections["overlap_ha"] = intersections.geometry.area / 10000
@@ -301,8 +349,11 @@ def analyze(
         stand_ids,
         progress_callback=detail_progress_callback,
     )
-    parsed = [parse_detail(d) for d in details_raw]
-    detail_by_id = {normalize_stand_id(d["stand_id"]): d for d in parsed}
+    detail_by_id = {normalize_stand_id(d["_stand_id"]): d for d in details_raw}
+    stand_rows_by_ix = {
+        int(stand_ix): stand_row.to_dict()
+        for stand_ix, stand_row in s.set_index("stand_ix").iterrows()
+    }
 
     notice_volume_col = first_matching_column(
         n.columns, ["raiutav_maht", "raie_maht", "harvest_volume"]
@@ -316,142 +367,183 @@ def analyze(
 
     species_breakdown_rows = []
     intersection_rows = []
-    harvest_volume_notice_ids = set()
-
+    inventory_metric_rows = []
     for _, row in intersections.iterrows():
         sid = row["_join_stand_id"]
-        detail = detail_by_id.get(sid)
-        if not detail or not detail["species_rows"]:
-            intersection_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "overlap_ha": row["overlap_ha"],
-                    "stem_volume_m3": np.nan,
-                    "carbon_co2e_t": np.nan,
-                    "weighted_age_num": 0.0,
-                    "weighted_age_den": 0.0,
-                }
-            )
-            continue
+        stand_row = stand_rows_by_ix[int(row["stand_ix"])]
+        if "id" not in stand_row:
+            stand_row["id"] = stand_row[stand_id_col]
+        stand = build_stand_record(stand_row, detail_by_id.get(sid), as_of_date=date.today())
+        standing_volume = estimate_standing_volume(stand, float(row["overlap_ha"]))
 
-        species_with_estimates = []
-        rows_with_inventory_volume = [
-            sp for sp in detail["species_rows"] if sp["volume_m3_ha"] is not None
-        ]
-        if rows_with_inventory_volume:
-            for sp in rows_with_inventory_volume:
-                stem_m3 = sp["volume_m3_ha"] * row["overlap_ha"]
-                species_with_estimates.append(
-                    {
-                        **sp,
-                        "volume_m3": stem_m3,
-                        "carbon_co2e_t": carbon_from_species_volume(stem_m3, sp["species_code"]),
-                    }
-                )
+        notice_volume = notice_volume_by_ix.get(row["notice_ix"])
+        if pd.notna(notice_volume):
+            planned_harvest_volume = estimate_planned_harvest_volume(
+                float(notice_volume)
+                * float(row["overlap_ha"])
+                / total_overlap_by_notice[row["notice_ix"]],
+                stand=stand,
+            )
         else:
-            notice_volume = notice_volume_by_ix.get(row["notice_ix"])
-            if pd.notna(notice_volume):
-                species_with_estimates = estimate_intersection_from_notice_volume(
-                    notice_volume_m3=float(notice_volume),
-                    overlap_ha=row["overlap_ha"],
-                    total_overlap_ha=total_overlap_by_notice[row["notice_ix"]],
-                    species_rows=detail["species_rows"],
-                )
-            if species_with_estimates:
-                harvest_volume_notice_ids.add(row["notice_ix"])
+            planned_harvest_volume = estimate_planned_harvest_volume(float("nan"), stand=stand)
 
-        if not species_with_estimates:
-            intersection_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "overlap_ha": row["overlap_ha"],
-                    "stem_volume_m3": np.nan,
-                    "carbon_co2e_t": np.nan,
-                    "weighted_age_num": 0.0,
-                    "weighted_age_den": 0.0,
-                }
-            )
-            continue
-
-        total_stem = 0.0
-        total_carbon = 0.0
+        carbon = calculate_notice_carbon(
+            standing_species_volumes=standing_volume.species_volumes,
+            planned_harvest_species_volumes=planned_harvest_volume.species_volumes,
+        )
         age_num = 0.0
         age_den = 0.0
+        current_age_num = 0.0
+        current_age_den = 0.0
+        for estimate_scope, species_volumes in (
+            ("standing", standing_volume.species_volumes),
+            ("planned_harvest", planned_harvest_volume.species_volumes),
+        ):
+            for species_volume in species_volumes:
+                species_carbon = carbon_from_species_volume(
+                    species_volume.volume_m3,
+                    species_volume.species_code,
+                )
+                if estimate_scope == "standing" and species_volume.inventory_age is not None:
+                    age_num += species_volume.inventory_age * species_volume.volume_m3
+                    age_den += species_volume.volume_m3
+                if estimate_scope == "standing" and species_volume.current_age is not None:
+                    current_age_num += species_volume.current_age * species_volume.volume_m3
+                    current_age_den += species_volume.volume_m3
 
-        for sp in species_with_estimates:
-            stem_m3 = sp["volume_m3"]
-            carbon = sp["carbon_co2e_t"]
-            total_stem += stem_m3
-            total_carbon += carbon
-            if sp["age"] is not None:
-                age_num += sp["age"] * stem_m3
-                age_den += stem_m3
-
-            species_breakdown_rows.append(
-                {
-                    "notice_ix": row["notice_ix"],
-                    "stand_id": sid,
-                    "species_code": sp["species_code"],
-                    "species": sp["species_name"],
-                    "overlap_ha": row["overlap_ha"],
-                    "volume_m3": stem_m3,
-                    "carbon_co2e_t": carbon,
-                    "age": sp["age"],
-                    "site_class": detail["site_class"],
-                    "site_type": detail["site_type"],
-                    "drained": detail["drained"],
-                }
-            )
+                species_breakdown_rows.append(
+                    {
+                        "notice_ix": row["notice_ix"],
+                        "stand_id": sid,
+                        "source_record_id": species_volume.source_record_id,
+                        "stratum_code": species_volume.stratum_code,
+                        "estimate_scope": estimate_scope,
+                        "species_code": species_volume.species_code,
+                        "species": species_name_for_code(species_volume.species_code),
+                        "overlap_ha": row["overlap_ha"],
+                        "volume_m3": species_volume.volume_m3,
+                        "biomass_tco2": species_carbon,
+                        "age": species_volume.inventory_age,
+                        "current_age": species_volume.current_age,
+                        "site_class": stand.site_class,
+                        "site_type": stand.site_type,
+                        "drained": stand.drained,
+                    }
+                )
 
         intersection_rows.append(
             {
                 "notice_ix": row["notice_ix"],
                 "overlap_ha": row["overlap_ha"],
-                "stem_volume_m3": total_stem,
-                "carbon_co2e_t": total_carbon,
+                "standing_live_biomass_tco2": carbon.standing_live_biomass_tco2,
+                "planned_harvest_biomass_tco2": carbon.planned_harvest_biomass_tco2,
+                "standing_volume_basis": standing_volume.basis.value,
+                "planned_harvest_volume_basis": planned_harvest_volume.basis.value,
+                "standing_biomass_is_complete": standing_volume.is_complete,
+                "planned_harvest_biomass_is_complete": planned_harvest_volume.is_complete,
                 "weighted_age_num": age_num,
                 "weighted_age_den": age_den,
+                "weighted_current_age_num": current_age_num,
+                "weighted_current_age_den": current_age_den,
+            }
+        )
+        inventory_metric_rows.append(
+            {
+                "notice_ix": row["notice_ix"],
+                "overlap_ha": float(row["overlap_ha"]),
+                "inventory_date": stand.inventory_date,
+                "inventory_age_years": stand.inventory_age_years,
+                "increment_m3_ha_y": stand.current_increment_m3_ha_y,
             }
         )
 
     agg = aggregate_intersections(intersection_rows)
     if agg.empty:
         raise RuntimeError("Eraldiste detailandmeid ei õnnestunud laadida.")
+    current_age_rows = pd.DataFrame(intersection_rows)
+    current_age = current_age_rows.groupby("notice_ix", as_index=False).agg(
+        weighted_current_age_num=("weighted_current_age_num", "sum"),
+        weighted_current_age_den=("weighted_current_age_den", "sum"),
+    )
+    current_age["mean_current_age_years"] = current_age["weighted_current_age_num"] / current_age[
+        "weighted_current_age_den"
+    ].replace(0, np.nan)
+    agg = agg.merge(
+        current_age[["notice_ix", "mean_current_age_years"]],
+        on="notice_ix",
+        how="left",
+    )
 
     species_df = pd.DataFrame(species_breakdown_rows)
     if not species_df.empty:
+        species_df["scope_rank"] = species_df["estimate_scope"].eq("planned_harvest")
         dom = (
-            species_df.groupby(["notice_ix", "species"], as_index=False)["volume_m3"]
+            species_df.groupby(["notice_ix", "estimate_scope", "species"], as_index=False)[
+                "volume_m3"
+            ]
             .sum()
-            .sort_values(["notice_ix", "volume_m3"], ascending=[True, False])
+            .merge(
+                species_df[["notice_ix", "estimate_scope", "scope_rank"]].drop_duplicates(),
+                on=["notice_ix", "estimate_scope"],
+                how="left",
+            )
+            .sort_values(
+                ["notice_ix", "scope_rank", "volume_m3"],
+                ascending=[True, True, False],
+            )
             .drop_duplicates("notice_ix")
             .rename(columns={"species": "dominant_species"})[["notice_ix", "dominant_species"]]
         )
+        species_df = species_df.drop(columns="scope_rank")
         agg = agg.merge(dom, on="notice_ix", how="left")
 
     out = n.merge(agg, on="notice_ix", how="left")
     out["area_ha"] = out.geometry.area / 10000
-    out["inventory_coverage_pct"] = (
+    out["spatial_coverage_pct"] = (
         100 * out["covered_by_inventory_ha"] / out["area_ha"].replace(0, np.nan)
     )
-    out["carbon_t_per_ha"] = out["carbon_co2e_t"] / out["area_ha"].replace(0, np.nan)
-    out["calculation_basis"] = np.select(
-        [
-            out["notice_ix"].isin(harvest_volume_notice_ids),
-            out["carbon_co2e_t"].notna(),
-        ],
-        ["raiemahu põhine hinnang", "inventuuri tagavara"],
-        default="andmed puuduvad",
+    out["standing_live_biomass_tco2_ha"] = out["standing_live_biomass_tco2"] / out[
+        "area_ha"
+    ].replace(0, np.nan)
+    out["standing_volume_basis"] = out["standing_volume_basis"].fillna(VolumeBasis.UNKNOWN.value)
+    out["planned_harvest_volume_basis"] = out["planned_harvest_volume_basis"].fillna(
+        VolumeBasis.UNKNOWN.value
     )
-    out["data_quality"] = np.select(
-        [
-            out["notice_ix"].isin(harvest_volume_notice_ids),
-            out["inventory_coverage_pct"] >= 90,
-            out["inventory_coverage_pct"] >= 50,
-        ],
-        ["raiemahu põhine", "hea", "osaline"],
-        default="nõrk",
-    )
+    out["spatial_coverage_quality"] = out["spatial_coverage_pct"].apply(classify_spatial_coverage)
+    out["volume_source_quality"] = out["standing_volume_basis"]
+
+    inventory_metrics = pd.DataFrame(inventory_metric_rows)
+    notice_inventory_metrics = []
+    for notice_ix, rows in inventory_metrics.groupby("notice_ix"):
+        known_ages = rows.dropna(subset=["inventory_age_years", "inventory_date"])
+        if len(known_ages) != len(rows):
+            inventory_age_years = np.nan
+            inventory_date = None
+        else:
+            oldest_inventory = known_ages.loc[known_ages["inventory_date"].idxmin()]
+            inventory_date = oldest_inventory["inventory_date"]
+            inventory_age_years = oldest_inventory["inventory_age_years"]
+
+        recency = (
+            classify_inventory_recency(inventory_age_years)
+            if inventory_date is not None
+            else "teadmata"
+        )
+        increment = aggregate_increment(rows.to_dict("records"))
+        notice_inventory_metrics.append(
+            {
+                "notice_ix": notice_ix,
+                "inventory_date": inventory_date,
+                "inventory_age_years": inventory_age_years,
+                "inventory_recency": recency,
+                "current_increment_m3_ha_y": increment.current_increment_m3_ha_y,
+                "current_increment_on_overlap_m3_y": increment.current_increment_on_overlap_m3_y,
+                "current_increment_covered_area_ha": (increment.current_increment_covered_area_ha),
+                "current_increment_coverage_pct": increment.current_increment_coverage_pct,
+                "current_increment_is_complete": increment.current_increment_is_complete,
+            }
+        )
+    out = out.merge(pd.DataFrame(notice_inventory_metrics), on="notice_ix", how="left")
     return out.to_crs(4326), species_df
 
 
@@ -465,6 +557,44 @@ def likely_notice_id_column(gdf):
     return first_matching_column(
         gdf.columns, ["teatis_id", "teatise_id", "id", "teatise_nr", "number"]
     )
+
+
+def build_export_table(results: pd.DataFrame) -> pd.DataFrame:
+    """Select the stable, user-facing result schema in display order."""
+    id_col = likely_notice_id_column(results)
+    harvest_type_col = likely_harvest_type_column(results)
+    requested_columns = [
+        id_col,
+        "raiutav_maht",
+        harvest_type_col,
+        "area_ha",
+        "dominant_species",
+        "mean_age",
+        "mean_current_age_years",
+        "standing_live_biomass_tco2",
+        "standing_live_biomass_tco2_ha",
+        "planned_harvest_biomass_tco2",
+        "standing_volume_basis",
+        "planned_harvest_volume_basis",
+        "standing_biomass_is_complete",
+        "planned_harvest_biomass_is_complete",
+        "inventory_date",
+        "inventory_age_years",
+        "inventory_recency",
+        "spatial_coverage_pct",
+        "spatial_coverage_quality",
+        "volume_source_quality",
+        "current_increment_m3_ha_y",
+        "current_increment_on_overlap_m3_y",
+        "current_increment_covered_area_ha",
+        "current_increment_coverage_pct",
+        "current_increment_is_complete",
+    ]
+    columns = []
+    for column in requested_columns:
+        if column and column in results and column not in columns:
+            columns.append(column)
+    return pd.DataFrame(results[columns]).rename(columns={"mean_age": "mean_inventory_age_years"})
 
 
 def fmt_num(x, digits=0):
@@ -481,7 +611,7 @@ def make_map(results: gpd.GeoDataFrame):
     center = gpd.GeoSeries([cent], crs=3301).to_crs(4326).iloc[0]
     m = folium.Map(location=[center.y, center.x], zoom_start=8, tiles="CartoDB positron")
 
-    vals = results["carbon_co2e_t"].replace([np.inf, -np.inf], np.nan).dropna()
+    vals = results["standing_live_biomass_tco2"].replace([np.inf, -np.inf], np.nan).dropna()
     q1 = vals.quantile(0.33) if len(vals) else 0
     q2 = vals.quantile(0.66) if len(vals) else 0
 
@@ -507,20 +637,35 @@ def make_map(results: gpd.GeoDataFrame):
             f"<b>Metsateatis</b>: {row.get(id_col, '–') if id_col else '–'}",
             f"Pindala: {fmt_num(row.get('area_ha'), 2)} ha",
             f"Valdav puuliik: {row.get('dominant_species', '–')}",
-            f"Keskmine vanus: {fmt_num(row.get('mean_age'), 0)} a",
-            f"Biomassi süsinik: {fmt_num(row.get('carbon_co2e_t'), 0)} t CO₂e",
-            f"Tüvemaht: {fmt_num(row.get('estimated_stem_volume_m3'), 0)} m³",
-            f"Arvutuse alus: {row.get('calculation_basis', 'andmed puuduvad')}",
-            f"Andmekate: {fmt_num(row.get('inventory_coverage_pct'), 0)}%",
+            f"Keskmine inventuurivanus: {fmt_num(row.get('mean_age'), 0)} a",
+            "Elusbiomassi süsinikuvaru: "
+            f"{fmt_num(row.get('standing_live_biomass_tco2'), 0)} t CO₂e",
+            "Kavandatava raiemahu biomass: "
+            f"{fmt_num(row.get('planned_harvest_biomass_tco2'), 0)} t CO₂e",
+            f"Elusbiomassi mahu alus: {row.get('standing_volume_basis', 'andmed puuduvad')}",
+            "Kavandatava raiemahu alus: "
+            f"{row.get('planned_harvest_volume_basis', 'andmed puuduvad')}",
+            f"Inventuuri kuupäev: {row.get('inventory_date', '–')}",
+            "Inventuuri vanus ja värskus: "
+            f"{fmt_num(row.get('inventory_age_years'), 2)} a · "
+            f"{row.get('inventory_recency', 'teadmata')}",
+            "Ruumiline andmekate: "
+            f"{fmt_num(row.get('spatial_coverage_pct'), 0)}% · "
+            f"{row.get('spatial_coverage_quality', 'teadmata')}",
+            "Jooksev juurdekasv: "
+            f"{fmt_num(row.get('current_increment_m3_ha_y'), 1)} m³/ha/a · "
+            f"{fmt_num(row.get('current_increment_on_overlap_m3_y'), 1)} m³/a",
         ]
         if harvest_col:
             popup.insert(1, f"Raieliik: {row.get(harvest_col, '–')}")
         if date_col and date_col in row:
             popup.insert(1, f"Kuupäev: {row.get(date_col, '–')}")
 
-        feature_color = color(row.get("carbon_co2e_t"))
+        feature_color = color(row.get("standing_live_biomass_tco2"))
         tooltip = (
-            f"{fmt_num(row.get('carbon_co2e_t'), 0)} t CO₂e · {row.get('dominant_species', '–')}"
+            "Elusbiomassi süsinikuvaru "
+            f"{fmt_num(row.get('standing_live_biomass_tco2'), 0)} t CO₂e · "
+            f"{row.get('dominant_species', '–')}"
         )
         folium.GeoJson(
             row.geometry.__geo_interface__,
@@ -539,7 +684,7 @@ def make_map(results: gpd.GeoDataFrame):
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
-st.title("🌲 Metsateatiste süsinikumõju — MVP")
+st.title("🌲 Metsateatiste biomassi süsinik — MVP")
 st.caption(
     "Metsaregistri WFS → ainult kattuvate eraldiste detail-API → puuliigipõhine biomassi süsinik"
 )
@@ -563,7 +708,8 @@ with st.sidebar:
     st.markdown("**Süsiniku MVP**")
     st.caption(
         "Puuliigiti: tüvemaht × puidutihedus × BEF 1.30 × C 0.50 × 44/12. "
-        "Tulemus on eluspuude biomassis oleva CO₂e hinnang, mitte veel täielik lageraie kliimamõju."
+        "Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass "
+        "ei ole heite ega kliimamõju hinnangud."
     )
 
 if refresh_data:
@@ -642,27 +788,86 @@ if "results" in st.session_state:
     if "species_code" in species_df.columns:
         species_df = species_df.copy()
         species_df["species"] = species_df["species_code"].apply(species_name_for_code)
-    valid = results[results["carbon_co2e_t"].notna()].copy()
+    valid_standing = results[results["standing_live_biomass_tco2"].notna()].copy()
+    valid_planned = results[results["planned_harvest_biomass_tco2"].notna()].copy()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Metsateatisi", f"{len(results):,}".replace(",", " "))
     c2.metric("Raiealade pindala", f"{results['area_ha'].sum():,.1f} ha".replace(",", " "))
     c3.metric(
-        "Biomassi süsinik",
-        f"{valid['carbon_co2e_t'].sum():,.0f} t CO₂e".replace(",", " ") if len(valid) else "–",
+        "Elusbiomassi süsinikuvaru",
+        f"{valid_standing['standing_live_biomass_tco2'].sum():,.0f} t CO₂e".replace(",", " ")
+        if len(valid_standing)
+        else "–",
     )
     c4.metric(
-        "Keskmine",
-        f"{valid['carbon_t_per_ha'].mean():,.0f} t CO₂e/ha".replace(",", " ")
-        if len(valid)
+        "Kavandatava raiemahu biomass",
+        f"{valid_planned['planned_harvest_biomass_tco2'].sum():,.0f} t CO₂e".replace(",", " ")
+        if len(valid_planned)
         else "–",
     )
 
-    harvest_estimates = results["calculation_basis"].eq("raiemahu põhine hinnang").sum()
+    standing_sources = " + ".join(
+        sorted({str(value) for value in results["standing_volume_basis"].dropna()})
+    )
+    planned_sources = " + ".join(
+        sorted({str(value) for value in results["planned_harvest_volume_basis"].dropna()})
+    )
+    st.caption(
+        f"Elusbiomassi mahu alus: {standing_sources or 'andmed puuduvad'} · "
+        f"Kavandatava raiemahu alus: {planned_sources or 'andmed puuduvad'}"
+    )
+
+    inventory_dates = sorted({str(value) for value in results["inventory_date"].dropna()})
+    inventory_recency = ", ".join(
+        sorted({str(value) for value in results["inventory_recency"].dropna()})
+    )
+    inventory_ages = results["inventory_age_years"].dropna()
+    st.caption(
+        f"Inventuuri kuupäev: {', '.join(inventory_dates) or '–'} · "
+        f"vanus: {fmt_num(inventory_ages.max(), 2) if len(inventory_ages) else '–'} a · "
+        f"värskus: {inventory_recency or 'teadmata'}"
+    )
+
+    increment_complete = results.get(
+        "current_increment_is_complete",
+        results["current_increment_on_overlap_m3_y"].notna(),
+    ).astype(bool)
+    increment_totals = pd.to_numeric(results["current_increment_on_overlap_m3_y"], errors="coerce")
+    increment_areas = pd.to_numeric(
+        results.get("current_increment_covered_area_ha"), errors="coerce"
+    )
+    compatible_increment = (
+        increment_complete
+        & np.isfinite(increment_totals)
+        & np.isfinite(increment_areas)
+        & (increment_areas > 0)
+    )
+    dashboard_increment_total = increment_totals.loc[compatible_increment].sum(min_count=1)
+    dashboard_increment_area = increment_areas.loc[compatible_increment].sum(min_count=1)
+    dashboard_increment_rate = (
+        dashboard_increment_total / dashboard_increment_area
+        if pd.notna(dashboard_increment_total)
+        and pd.notna(dashboard_increment_area)
+        and dashboard_increment_area > 0
+        else np.nan
+    )
+    st.caption(
+        "Jooksev juurdekasv: "
+        f"{fmt_num(dashboard_increment_rate, 1)} m³/ha/a · "
+        f"{fmt_num(dashboard_increment_total, 1)} m³/a"
+    )
+
+    harvest_estimates = (
+        results["planned_harvest_volume_basis"]
+        .astype(str)
+        .str.contains(VolumeBasis.NOTICE_HARVEST_VOLUME.value, regex=False)
+        .sum()
+    )
     if harvest_estimates:
         st.info(
-            f"{harvest_estimates} teatise süsinik on hinnatud raiutava mahu ja "
-            "puuliikide osakaalude põhjal, sest inventuuri tagavara puudus."
+            f"{harvest_estimates} teatise kavandatava raiemahu biomass põhineb teatises "
+            "esitatud raiemahul ja puuliikide osakaaludel. See ei ole heite hinnang."
         )
 
     tab1, tab2, tab3, tab4 = st.tabs(["Kaart", "Koond", "Puuliigid", "Andmed"])
@@ -673,70 +878,76 @@ if "results" in st.session_state:
     with tab2:
         left, right = st.columns(2)
         with left:
-            st.subheader("Süsinik teatise kaupa")
-            chart_df = valid[["carbon_co2e_t"]].copy()
+            st.subheader("Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass teatise kaupa")
+            chart_df = results[
+                ["standing_live_biomass_tco2", "planned_harvest_biomass_tco2"]
+            ].dropna(how="all")
+            chart_df = chart_df.rename(
+                columns={
+                    "standing_live_biomass_tco2": "Elusbiomassi süsinikuvaru (t CO₂e)",
+                    "planned_harvest_biomass_tco2": ("Kavandatava raiemahu biomass (t CO₂e)"),
+                }
+            )
             chart_df["teatis"] = np.arange(1, len(chart_df) + 1)
-            st.bar_chart(chart_df.set_index("teatis"), y="carbon_co2e_t", height=350)
+            st.bar_chart(chart_df.set_index("teatis"), height=350)
         with right:
-            st.subheader("Andmekatte kvaliteet")
-            quality = (
-                results["data_quality"]
+            st.subheader("Ruumilise andmekatte kvaliteet")
+            spatial_quality = (
+                results["spatial_coverage_quality"]
                 .value_counts()
                 .rename_axis("kvaliteet")
                 .reset_index(name="teatisi")
             )
-            st.bar_chart(quality.set_index("kvaliteet"), y="teatisi", height=350)
+            st.bar_chart(spatial_quality.set_index("kvaliteet"), y="teatisi", height=160)
+            st.subheader("Inventuuri värskus")
+            recency = (
+                results["inventory_recency"]
+                .value_counts()
+                .rename_axis("värskus")
+                .reset_index(name="teatisi")
+            )
+            st.bar_chart(recency.set_index("värskus"), y="teatisi", height=160)
 
-        st.subheader("Suurima biomassi süsinikuga teatised")
-        id_col = likely_notice_id_column(results)
-        harvest_col = likely_harvest_type_column(results)
-        cols = [
-            c
-            for c in [
-                id_col,
-                harvest_col,
-                "dominant_species",
-                "mean_age",
-                "area_ha",
-                "estimated_stem_volume_m3",
-                "carbon_co2e_t",
-                "carbon_t_per_ha",
-                "inventory_coverage_pct",
-                "calculation_basis",
-                "data_quality",
-            ]
-            if c and c in results
-        ]
+        st.subheader("Suurima elusbiomassi süsinikuvaruga teatised")
+        summary = build_export_table(results)
         st.dataframe(
-            results.sort_values("carbon_co2e_t", ascending=False)[cols].head(20),
+            summary.sort_values("standing_live_biomass_tco2", ascending=False).head(20),
             use_container_width=True,
             hide_index=True,
         )
 
     with tab3:
-        st.subheader("Puuliikide panus biomassi süsinikku")
+        st.subheader("Puuliikide biomass hinnangu liigi kaupa")
         if species_df.empty:
             st.info("Puuliigipõhist detailinfot ei saadud.")
         else:
             by_species = (
-                species_df.groupby("species", as_index=False)
+                species_df.groupby(["species", "estimate_scope"], as_index=False)
                 .agg(
                     volume_m3=("volume_m3", "sum"),
-                    carbon_co2e_t=("carbon_co2e_t", "sum"),
+                    biomass_tco2=("biomass_tco2", "sum"),
                 )
-                .sort_values("carbon_co2e_t", ascending=False)
+                .sort_values("biomass_tco2", ascending=False)
             )
-            st.bar_chart(by_species.set_index("species"), y="carbon_co2e_t", height=380)
+            species_chart = by_species.pivot(
+                index="species", columns="estimate_scope", values="biomass_tco2"
+            ).rename(
+                columns={
+                    "standing": "Elusbiomassi süsinikuvaru (t CO₂e)",
+                    "planned_harvest": "Kavandatava raiemahu biomass (t CO₂e)",
+                }
+            )
+            st.bar_chart(species_chart, height=380)
             st.dataframe(by_species, use_container_width=True, hide_index=True)
 
     with tab4:
-        non_geom = pd.DataFrame(results.drop(columns=[results.geometry.name], errors="ignore"))
+        non_geom = build_export_table(results)
         st.dataframe(non_geom, use_container_width=True, hide_index=True)
         csv = non_geom.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "Laadi tulemused CSV-na",
             csv,
-            "metsateatised_susinikumõju.csv",
+            "metsateatised_biomassi_susinik.csv",
             "text/csv",
         )
 
@@ -756,10 +967,14 @@ Valem on:
 
 `tüvemaht liigiti × puidutihedus liigiti × BEF × C-fraktsioon × 44/12`.
 
-See tulemus kirjeldab hinnanguliselt **praegu eluspuude biomassis olevat CO₂e
-kogust raiutaval alal**. See ei ole veel lageraie netokliimamõju. Selleks tuleb
-järgmises etapis võrrelda vähemalt kahte ajas kulgevat stsenaariumi: **raieta** vs
-**lageraie + metsauuendus**, ning lisada raiutud puittooted, surnud orgaaniline
-aine ja mullasüsinik.
+**Elusbiomassi süsinikuvaru** kirjeldab inventuuriandmetest hinnatud praegust
+eluspuude biomassi. **Kavandatava raiemahu biomass** arvutatakse teatises esitatud
+raiemahust eraldi. See ei ole heite ega kliimamõju hinnang.
+
+Jooksev juurdekasv on inventuuri hetkeseisu aastane mahunäitaja. Seda ei kasutata
+tulevase tagavara ega süsinikuvaru prognoosimiseks. Kliimamõju hindamiseks tuleb
+eraldi mudelis võrrelda ajas kulgevaid stsenaariume — vähemalt raie puudumist ning
+raiet koos metsauuendusega — ja lisada raiutud puittooted, surnud orgaaniline aine
+ning mullasüsinik.
             """
         )

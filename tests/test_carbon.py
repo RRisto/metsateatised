@@ -7,8 +7,8 @@ from carbon import (
     density_for_species,
     estimate_intersection_from_notice_volume,
     parse_detail,
-    species_name_for_code,
 )
+from stand_model import species_name_for_code
 
 
 def test_density_normalizes_species_code():
