@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from datetime import date
 
 import pytest
@@ -41,6 +43,22 @@ DETAIL = {
         },
     ]
 }
+
+
+def test_stand_model_import_does_not_load_carbon_calculation_layer():
+    """Importing the domain model must not depend on the carbon calculation module."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import stand_model; raise SystemExit('carbon' in sys.modules)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_build_stand_record_merges_wfs_and_detail():
@@ -97,10 +115,15 @@ def test_normalize_species_records_keeps_missing_stock_and_ignores_negative_stoc
 
 
 def test_build_stand_record_excludes_invalid_stock_components():
-    """Including negative or non-finite WFS stock would inflate the total."""
+    """Rejected inputs remain auditable while invalid values stay out of the total."""
     row = {**WFS_STAND, "tagavara_1_ha": "nan", "tagavara_2_ha": -2, "tagavara_y_ha": "7"}
 
     stand = build_stand_record(row, None, as_of_date=date(2026, 8, 9))
 
     assert stand.stock_m3_ha == 7.0
     assert stand.raw_stock_components_m3_ha == {"young": 7.0}
+    assert stand.raw_stock_component_inputs == {
+        "tagavara_1_ha": "nan",
+        "tagavara_2_ha": -2,
+        "tagavara_y_ha": "7",
+    }

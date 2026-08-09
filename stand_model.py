@@ -7,7 +7,45 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from math import isfinite
 
-from carbon import species_name_for_code
+SPECIES_NAMES = {
+    "0": "Määramata",
+    "HB": "Haab",
+    "JA": "Jalakas",
+    "KD": "Kadakas",
+    "KP": "Künnapuu",
+    "KS": "Kask",
+    "KU": "Kuusk",
+    "LH": "Lehis",
+    "LM": "Sanglepp",
+    "LV": "Hall lepp",
+    "MA": "Mänd",
+    "NU": "Nulg",
+    "PA": "Paju",
+    "PI": "Pihlakas",
+    "PK": "Paakspuu",
+    "PN": "Pärn",
+    "PP": "Pappel",
+    "RE": "Remmelgas",
+    "SA": "Saar",
+    "SD": "Seedermänd",
+    "SP": "Sarapuu",
+    "TA": "Tamm",
+    "TL": "Teised lehtpuud",
+    "TM": "Toomingas",
+    "TO": "Teised okaspuud",
+    "TP": "Teised põõsaliigid",
+    "TS": "Ebatsuuga",
+    "TY": "Türnpuu",
+    "VA": "Vaher",
+}
+
+
+def species_name_for_code(code: str | None) -> str:
+    """Return the display name used by Forest Register species codes."""
+    if code is None or not str(code).strip():
+        return "Muu"
+    normalized_code = str(code).strip().upper()
+    return SPECIES_NAMES.get(normalized_code, f"Muu ({normalized_code})")
 
 
 @dataclass(frozen=True)
@@ -31,6 +69,7 @@ class StandRecord:
     height_m: float | None
     stock_m3_ha: float | None
     raw_stock_components_m3_ha: dict[str, float]
+    raw_stock_component_inputs: dict[str, object]
     current_increment_m3_ha_y: float | None
     basal_area_m2_ha: float | None
     stocking_pct: float | None
@@ -152,12 +191,15 @@ def build_stand_record(
     )
 
     stock_components = {}
+    raw_stock_component_inputs = {}
     for output_name, field_name in (
         ("layer_1", "tagavara_1_ha"),
         ("layer_2", "tagavara_2_ha"),
         ("young", "tagavara_y_ha"),
     ):
-        value = _finite_float(wfs_row.get(field_name))
+        raw_value = wfs_row.get(field_name)
+        raw_stock_component_inputs[field_name] = raw_value
+        value = _finite_float(raw_value)
         if value is not None and value >= 0:
             stock_components[output_name] = value
 
@@ -171,6 +213,7 @@ def build_stand_record(
         height_m=_finite_float(wfs_row.get("korgus")),
         stock_m3_ha=sum(stock_components.values()) if stock_components else None,
         raw_stock_components_m3_ha=stock_components,
+        raw_stock_component_inputs=raw_stock_component_inputs,
         current_increment_m3_ha_y=_finite_float(wfs_row.get("juurdekasv")),
         basal_area_m2_ha=_finite_float(wfs_row.get("rpindala_1")),
         stocking_pct=_finite_float(wfs_row.get("taius_1")),
