@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
+
 import numpy as np
 import pandas as pd
+
+from stand_model import SpeciesRecord, StandRecord
+from stand_model import species_name_for_code as _species_name_for_code
 
 WOOD_DENSITY = {
     "MA": 0.42,
@@ -13,41 +19,36 @@ WOOD_DENSITY = {
     "SA": 0.57,
     "TA": 0.58,
 }
-SPECIES_NAMES = {
-    "0": "Määramata",
-    "HB": "Haab",
-    "JA": "Jalakas",
-    "KD": "Kadakas",
-    "KP": "Künnapuu",
-    "KS": "Kask",
-    "KU": "Kuusk",
-    "LH": "Lehis",
-    "LM": "Sanglepp",
-    "LV": "Hall lepp",
-    "MA": "Mänd",
-    "NU": "Nulg",
-    "PA": "Paju",
-    "PI": "Pihlakas",
-    "PK": "Paakspuu",
-    "PN": "Pärn",
-    "PP": "Pappel",
-    "RE": "Remmelgas",
-    "SA": "Saar",
-    "SD": "Seedermänd",
-    "SP": "Sarapuu",
-    "TA": "Tamm",
-    "TL": "Teised lehtpuud",
-    "TM": "Toomingas",
-    "TO": "Teised okaspuud",
-    "TP": "Teised põõsaliigid",
-    "TS": "Ebatsuuga",
-    "TY": "Türnpuu",
-    "VA": "Vaher",
-}
 DEFAULT_WOOD_DENSITY = 0.42
 CARBON_FRACTION = 0.50
 CO2_PER_C = 44.0 / 12.0
 BEF = 1.30
+
+
+class VolumeBasis(StrEnum):
+    """Provenance for an estimated stem-volume total."""
+
+    DETAIL_SPECIES_STOCK = "detail-liigiline tagavara"
+    WFS_STAND_STOCK_ALLOCATED = "eraldise tagavara + liigiosakaal"
+    NOTICE_HARVEST_VOLUME = "raiemahu põhine hinnang"
+    UNKNOWN = "andmed puuduvad"
+
+
+@dataclass(frozen=True)
+class SpeciesVolume:
+    """A stem-volume allocation for one tree species."""
+
+    species_code: str | None
+    volume_m3: float
+
+
+@dataclass(frozen=True)
+class StandingVolumeEstimate:
+    """A volume estimate with its explicit source and species allocation."""
+
+    basis: VolumeBasis
+    total_volume_m3: float | None
+    species_volumes: tuple[SpeciesVolume, ...]
 
 
 def aggregate_intersections(intersection_rows: list[dict]) -> pd.DataFrame:
@@ -79,10 +80,74 @@ def density_for_species(code: str | None) -> float:
 
 
 def species_name_for_code(code: str | None) -> str:
-    if code is None or not str(code).strip():
-        return "Muu"
-    normalized_code = str(code).strip().upper()
-    return SPECIES_NAMES.get(normalized_code, f"Muu ({normalized_code})")
+    """Compatibility wrapper for the canonical stand-model species helper."""
+    return _species_name_for_code(code)
+
+
+def _allocate_species_volumes(
+    total_volume_m3: float, species: tuple[SpeciesRecord, ...]
+) -> tuple[SpeciesVolume, ...]:
+    species_with_share = tuple(
+        item for item in species if item.share_pct is not None and item.share_pct > 0
+    )
+    total_share = sum(item.share_pct for item in species_with_share)
+    if total_volume_m3 <= 0 or total_share <= 0:
+        return ()
+
+    return tuple(
+        SpeciesVolume(
+            species_code=item.code,
+            volume_m3=total_volume_m3 * item.share_pct / total_share,
+        )
+        for item in species_with_share
+    )
+
+
+def estimate_standing_volume(stand: StandRecord, overlap_ha: float) -> StandingVolumeEstimate:
+    """Estimate standing stock from inventory sources, never a notice harvest quantity."""
+    if overlap_ha <= 0:
+        return StandingVolumeEstimate(VolumeBasis.UNKNOWN, None, ())
+
+    detail_species = tuple(item for item in stand.species if item.stock_m3_ha is not None)
+    if detail_species:
+        species_volumes = tuple(
+            SpeciesVolume(
+                species_code=item.code,
+                volume_m3=item.stock_m3_ha * overlap_ha,
+            )
+            for item in detail_species
+        )
+        return StandingVolumeEstimate(
+            VolumeBasis.DETAIL_SPECIES_STOCK,
+            sum(item.volume_m3 for item in species_volumes),
+            species_volumes,
+        )
+
+    if stand.stock_m3_ha is not None:
+        total_volume_m3 = stand.stock_m3_ha * overlap_ha
+        species_volumes = _allocate_species_volumes(total_volume_m3, stand.species)
+        if species_volumes:
+            return StandingVolumeEstimate(
+                VolumeBasis.WFS_STAND_STOCK_ALLOCATED,
+                total_volume_m3,
+                species_volumes,
+            )
+
+    return StandingVolumeEstimate(VolumeBasis.UNKNOWN, None, ())
+
+
+def estimate_planned_harvest_volume(
+    notice_volume_m3: float, species: tuple[SpeciesRecord, ...]
+) -> StandingVolumeEstimate:
+    """Allocate a notice's planned harvest volume independently from standing stock."""
+    if notice_volume_m3 < 0:
+        return StandingVolumeEstimate(VolumeBasis.UNKNOWN, None, ())
+
+    return StandingVolumeEstimate(
+        VolumeBasis.NOTICE_HARVEST_VOLUME,
+        notice_volume_m3,
+        _allocate_species_volumes(notice_volume_m3, species),
+    )
 
 
 def carbon_from_species_volume(volume_m3: float, species_code: str | None) -> float:
