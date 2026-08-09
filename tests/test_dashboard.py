@@ -20,6 +20,7 @@ def dashboard_result_fixture():
             "planned_harvest_volume_basis": ["raiemahu põhine hinnang"],
             "dominant_species": ["Kask"],
             "mean_age": [45.0],
+            "mean_current_age_years": [50.0],
             "spatial_coverage_pct": [95.0],
             "spatial_coverage_quality": ["hea"],
             "volume_source_quality": ["eraldise tagavara + liigiosakaal"],
@@ -63,6 +64,17 @@ def test_distinct_carbon_and_inventory_metrics_reach_streamlit_dashboard():
     assert app.metric[3].value == "120 t CO₂e"
 
     rendered_text = _rendered_text(app)
+    assert "Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass teatise kaupa" in [
+        subheader.value for subheader in app.subheader
+    ]
+    assert any(
+        "Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass "
+        "ei ole heite ega kliimamõju hinnangud." in caption.value
+        for caption in app.caption
+    )
+    assert all(
+        "mitte veel täielik lageraie kliimamõju" not in caption.value for caption in app.caption
+    )
     assert "eraldise tagavara + liigiosakaal" in rendered_text
     assert "raiemahu põhine hinnang" in rendered_text
     assert "2021-07-29" in rendered_text
@@ -72,6 +84,8 @@ def test_distinct_carbon_and_inventory_metrics_reach_streamlit_dashboard():
     assert "See ei ole heite hinnang." in rendered_text
 
     summary = app.dataframe[0].value
+    assert summary.loc[0, "mean_inventory_age_years"] == pytest.approx(45.0)
+    assert summary.loc[0, "mean_current_age_years"] == pytest.approx(50.0)
     assert summary.loc[0, "standing_live_biomass_tco2"] == pytest.approx(300.0)
     assert summary.loc[0, "planned_harvest_biomass_tco2"] == pytest.approx(120.0)
 
@@ -94,6 +108,7 @@ def test_export_schema_is_explicit_and_excludes_legacy_aggregates():
         "area_ha",
         "dominant_species",
         "mean_inventory_age_years",
+        "mean_current_age_years",
         "standing_live_biomass_tco2",
         "standing_live_biomass_tco2_ha",
         "planned_harvest_biomass_tco2",
@@ -110,6 +125,8 @@ def test_export_schema_is_explicit_and_excludes_legacy_aggregates():
         "current_increment_coverage_pct",
         "current_increment_is_complete",
     ]
+    assert exported.loc[0, "mean_inventory_age_years"] == pytest.approx(45.0)
+    assert exported.loc[0, "mean_current_age_years"] == pytest.approx(50.0)
 
 
 def test_map_popup_keeps_biomass_quantities_and_sources_separate():

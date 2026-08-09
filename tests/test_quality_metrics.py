@@ -86,7 +86,15 @@ def test_analyze_exposes_independent_quality_and_complete_increment_metrics(monk
         lambda *_args, **_kwargs: [
             {
                 "_stand_id": 1,
-                "elemendid": [{"puuliigiKood": "KS", "osakaal": 100, "tagavara": 20}],
+                "elemendid": [
+                    {
+                        "puuliigiKood": "KS",
+                        "osakaal": 100,
+                        "tagavara": 20,
+                        "vanus": 40,
+                        "jooksevVanus": 45,
+                    }
+                ],
             }
         ],
     )
@@ -102,6 +110,7 @@ def test_analyze_exposes_independent_quality_and_complete_increment_metrics(monk
         "volume_source_quality",
         "current_increment_m3_ha_y",
         "current_increment_on_overlap_m3_y",
+        "mean_current_age_years",
     } <= set(result.columns)
     assert row.spatial_coverage_pct == pytest.approx(50.0)
     assert row.spatial_coverage_quality == "osaline"
@@ -111,6 +120,8 @@ def test_analyze_exposes_independent_quality_and_complete_increment_metrics(monk
     assert row.current_increment_on_overlap_m3_y == pytest.approx(8.0)
     assert row.current_increment_coverage_pct == pytest.approx(100.0)
     assert bool(row.current_increment_is_complete) is True
+    assert row.mean_age == pytest.approx(40.0)
+    assert row.mean_current_age_years == pytest.approx(45.0)
 
 
 def test_analyze_uses_oldest_inventory_for_age_and_marks_partial_increment(monkeypatch):
@@ -134,9 +145,19 @@ def test_analyze_uses_oldest_inventory_for_age_and_marks_partial_increment(monke
         lambda *_args, **_kwargs: [
             {
                 "_stand_id": 1,
-                "elemendid": [{"puuliigiKood": "KS", "osakaal": 100, "tagavara": 20}],
+                "elemendid": [
+                    {
+                        "puuliigiKood": "KS",
+                        "osakaal": 100,
+                        "tagavara": 20,
+                        "jooksevVanus": 50,
+                    }
+                ],
             },
-            {"_stand_id": 2, "elemendid": [{"puuliigiKood": "KU", "osakaal": 100}]},
+            {
+                "_stand_id": 2,
+                "elemendid": [{"puuliigiKood": "KU", "osakaal": 100, "jooksevVanus": 80}],
+            },
         ],
     )
 
@@ -156,6 +177,7 @@ def test_analyze_uses_oldest_inventory_for_age_and_marks_partial_increment(monke
     assert pd.isna(row.current_increment_m3_ha_y)
     assert row.current_increment_coverage_pct == pytest.approx(50.0)
     assert bool(row.current_increment_is_complete) is False
+    assert row.mean_current_age_years == pytest.approx(68.0)
 
 
 def test_analyze_no_intersection_exposes_unknown_inventory_dimensions():
@@ -173,5 +195,7 @@ def test_analyze_no_intersection_exposes_unknown_inventory_dimensions():
     assert row.spatial_coverage_quality == "nõrk"
     assert row.inventory_recency == "teadmata"
     assert row.volume_source_quality == VolumeBasis.UNKNOWN.value
+    assert pd.isna(row.mean_age)
+    assert pd.isna(row.mean_current_age_years)
     assert pd.isna(row.current_increment_m3_ha_y)
     assert pd.isna(row.current_increment_on_overlap_m3_y)

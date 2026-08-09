@@ -299,6 +299,8 @@ def analyze(
         out["standing_live_biomass_tco2"] = np.nan
         out["standing_live_biomass_tco2_ha"] = np.nan
         out["planned_harvest_biomass_tco2"] = np.nan
+        out["mean_age"] = np.nan
+        out["mean_current_age_years"] = np.nan
         out["standing_volume_basis"] = VolumeBasis.UNKNOWN.value
         out["planned_harvest_volume_basis"] = VolumeBasis.UNKNOWN.value
         out["spatial_coverage_pct"] = 0.0
@@ -365,6 +367,8 @@ def analyze(
         )
         age_num = 0.0
         age_den = 0.0
+        current_age_num = 0.0
+        current_age_den = 0.0
         species_by_code = {species.code: species for species in stand.species}
         for estimate_scope, species_volumes in (
             ("standing", standing_volume.species_volumes),
@@ -379,6 +383,9 @@ def analyze(
                 if estimate_scope == "standing" and species and species.inventory_age is not None:
                     age_num += species.inventory_age * species_volume.volume_m3
                     age_den += species_volume.volume_m3
+                if estimate_scope == "standing" and species and species.current_age is not None:
+                    current_age_num += species.current_age * species_volume.volume_m3
+                    current_age_den += species_volume.volume_m3
 
                 species_breakdown_rows.append(
                     {
@@ -391,6 +398,7 @@ def analyze(
                         "volume_m3": species_volume.volume_m3,
                         "biomass_tco2": species_carbon,
                         "age": species.inventory_age if species else None,
+                        "current_age": species.current_age if species else None,
                         "site_class": stand.site_class,
                         "site_type": stand.site_type,
                         "drained": stand.drained,
@@ -407,6 +415,8 @@ def analyze(
                 "planned_harvest_volume_basis": planned_harvest_volume.basis.value,
                 "weighted_age_num": age_num,
                 "weighted_age_den": age_den,
+                "weighted_current_age_num": current_age_num,
+                "weighted_current_age_den": current_age_den,
             }
         )
         inventory_metric_rows.append(
@@ -422,6 +432,19 @@ def analyze(
     agg = aggregate_intersections(intersection_rows)
     if agg.empty:
         raise RuntimeError("Eraldiste detailandmeid ei õnnestunud laadida.")
+    current_age_rows = pd.DataFrame(intersection_rows)
+    current_age = current_age_rows.groupby("notice_ix", as_index=False).agg(
+        weighted_current_age_num=("weighted_current_age_num", "sum"),
+        weighted_current_age_den=("weighted_current_age_den", "sum"),
+    )
+    current_age["mean_current_age_years"] = current_age["weighted_current_age_num"] / current_age[
+        "weighted_current_age_den"
+    ].replace(0, np.nan)
+    agg = agg.merge(
+        current_age[["notice_ix", "mean_current_age_years"]],
+        on="notice_ix",
+        how="left",
+    )
 
     species_df = pd.DataFrame(species_breakdown_rows)
     if not species_df.empty:
@@ -518,6 +541,7 @@ def build_export_table(results: pd.DataFrame) -> pd.DataFrame:
         "area_ha",
         "dominant_species",
         "mean_age",
+        "mean_current_age_years",
         "standing_live_biomass_tco2",
         "standing_live_biomass_tco2_ha",
         "planned_harvest_biomass_tco2",
@@ -652,7 +676,8 @@ with st.sidebar:
     st.markdown("**Süsiniku MVP**")
     st.caption(
         "Puuliigiti: tüvemaht × puidutihedus × BEF 1.30 × C 0.50 × 44/12. "
-        "Tulemus on eluspuude biomassis oleva CO₂e hinnang, mitte veel täielik lageraie kliimamõju."
+        "Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass "
+        "ei ole heite ega kliimamõju hinnangud."
     )
 
 if refresh_data:
@@ -797,7 +822,7 @@ if "results" in st.session_state:
     with tab2:
         left, right = st.columns(2)
         with left:
-            st.subheader("Biomassi süsinik teatise kaupa")
+            st.subheader("Elusbiomassi süsinikuvaru ja kavandatava raiemahu biomass teatise kaupa")
             chart_df = results[
                 ["standing_live_biomass_tco2", "planned_harvest_biomass_tco2"]
             ].dropna(how="all")

@@ -112,8 +112,8 @@ Andmekvaliteet esitatakse sõltumatute mõõtmetena:
   teatise pindalast on eraldiste inventuuriandmetega kaetud. Piirid on vähemalt
   90% `hea`, vähemalt 50% `osaline` ja alla 50% `nõrk`;
 - `mean_inventory_age_years` on puuliikide mahu järgi kaalutud keskmine vanus
-  inventuuri hetkel. Liigi inventuurivanust ei segata detailandmetes oleva jooksva
-  vanusega;
+  inventuuri hetkel. `mean_current_age_years` on eraldi puuliikide mahu järgi
+  kaalutud keskmine jooksev vanus. Inventuurivanust ja jooksvat vanust ei segata;
 - `current_increment_m3_ha_y` on inventuuri hetkeseisu pindalapõhine jooksev
   juurdekasv ja `current_increment_on_overlap_m3_y` sama näitaja kattuva ala
   kohta. `current_increment_coverage_pct` ja `current_increment_is_complete`
