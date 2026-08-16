@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import folium
 import geopandas as gpd
 import pandas as pd
 import pytest
@@ -139,12 +140,102 @@ def test_map_popup_keeps_biomass_quantities_and_sources_separate():
     """Dropping either estimate or provenance would make map interpretation ambiguous."""
     import app as dashboard_app
 
-    rendered_map = dashboard_app.make_map(dashboard_result_fixture()).get_root().render()
+    rendered_map = dashboard_app.make_map(dashboard_result_fixture())
+    geojson_layer = next(
+        child for child in rendered_map._children.values() if isinstance(child, folium.GeoJson)
+    )
+    popup = geojson_layer.data["features"][0]["properties"]["_popup"]
 
-    assert "Elusbiomassi süsinikuvaru: 300 t CO₂e" in rendered_map
-    assert "Kavandatava raiemahu biomass: 120 t CO₂e" in rendered_map
-    assert "Elusbiomassi mahu alus: eraldise tagavara + liigiosakaal" in rendered_map
-    assert "Kavandatava raiemahu alus: raiemahu põhine hinnang" in rendered_map
+    assert "Elusbiomassi süsinikuvaru: 300 t CO₂e" in popup
+    assert "Kavandatava raiemahu biomass: 120 t CO₂e" in popup
+    assert "Elusbiomassi mahu alus: eraldise tagavara + liigiosakaal" in popup
+    assert "Kavandatava raiemahu alus: raiemahu põhine hinnang" in popup
+
+
+def test_cutting_type_map_uses_categorical_colors_and_legend():
+    """Using carbon thresholds in cutting-type mode would misrepresent the selected dimension."""
+    import app as dashboard_app
+
+    results = gpd.GeoDataFrame(
+        pd.concat(
+            [dashboard_result_fixture(), dashboard_result_fixture(), dashboard_result_fixture()],
+            ignore_index=True,
+        ),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    results["raie_liik"] = ["Harvendusraie", "Lageraie", None]
+
+    rendered_map = dashboard_app.make_map(results, color_mode="Raieliik").get_root().render()
+
+    assert "Raieliik" in rendered_map
+    assert "Harvendusraie" in rendered_map
+    assert "Lageraie" in rendered_map
+    assert "Puudub / teadmata" in rendered_map
+    assert "#1f78b4" in rendered_map
+    assert "#33a02c" in rendered_map
+    assert "#777777" in rendered_map
+
+
+def test_dashboard_offers_map_color_mode_selector():
+    """Without a mode selector users could not request cutting-type coloring."""
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.session_state["results"] = dashboard_result_fixture()
+    app.session_state["species_df"] = pd.DataFrame()
+
+    app.run(timeout=20)
+
+    assert not app.exception
+    selector = next(selectbox for selectbox in app.selectbox if selectbox.label == "Kaardi värv")
+    assert selector.options == ["Süsinikuvaru", "Raieliik"]
+
+
+def test_dashboard_offers_forced_recalculation_control():
+    """Without an override users could not refresh one persisted analysis on demand."""
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+
+    app.run(timeout=20)
+
+    assert not app.exception
+    assert any(
+        checkbox.label == "Arvuta uuesti (eirab salvestatud tulemust)"
+        for checkbox in app.checkbox
+    )
+
+
+def test_dashboard_allows_up_to_100000_notices_per_layer():
+    """A 50,000-record widget cap prevents selecting the requested ten-year volume."""
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+
+    app.run(timeout=20)
+
+    assert not app.exception
+    limit = next(
+        item for item in app.number_input if item.label == "Maksimaalne kirjete arv kihist"
+    )
+    assert limit.max == 100_000
+
+
+def test_map_batches_all_polygons_into_one_geojson_layer():
+    """Creating one Leaflet layer per polygon makes large result maps slow to serialize."""
+    import app as dashboard_app
+
+    results = gpd.GeoDataFrame(
+        pd.concat([dashboard_result_fixture(), dashboard_result_fixture()], ignore_index=True),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    results["teatis_id"] = [3973677.0, 3973678.0]
+
+    rendered_map = dashboard_app.make_map(results)
+    geojson_layers = [
+        child for child in rendered_map._children.values() if isinstance(child, folium.GeoJson)
+    ]
+
+    assert len(geojson_layers) == 1
+    rendered_html = rendered_map.get_root().render()
+    assert "3973677" in rendered_html
+    assert "3973678" in rendered_html
 
 
 def test_dashboard_increment_caption_uses_area_weighted_rate():

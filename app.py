@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 from collections.abc import Iterable
 from datetime import date, timedelta
@@ -16,6 +17,7 @@ import streamlit as st
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
+from analysis_cache import read_analysis_cache, write_analysis_cache
 from carbon import (
     VolumeBasis,
     aggregate_intersections,
@@ -46,6 +48,7 @@ LAYERS = {
     "stands": "metsaregister:eraldis",
 }
 INTERSECTION_AREA_TOLERANCE_M2 = 1e-6
+ANALYSIS_MODEL_VERSION = "estonia-bcef-v1"
 
 st.set_page_config(page_title="Metsateatiste biomassi süsinik MVP", layout="wide")
 
@@ -603,7 +606,38 @@ def fmt_num(x, digits=0):
     return f"{x:,.{digits}f}".replace(",", " ")
 
 
-def make_map(results: gpd.GeoDataFrame):
+MAP_COLOR_MODES = ("Süsinikuvaru", "Raieliik")
+CUTTING_TYPE_COLORS = (
+    "#1f78b4",
+    "#33a02c",
+    "#e31a1c",
+    "#ff7f00",
+    "#6a3d9a",
+    "#b15928",
+    "#a6cee3",
+    "#b2df8a",
+)
+MISSING_MAP_COLOR = "#777777"
+
+
+def _add_map_legend(m: folium.Map, title: str, entries: list[tuple[str, str]]) -> None:
+    items = "".join(
+        '<div style="display:flex;align-items:center;gap:6px;margin-top:4px">'
+        f'<span style="background:{color};width:14px;height:14px;display:inline-block;'
+        'border:1px solid #555"></span>'
+        f"<span>{html.escape(label)}</span></div>"
+        for label, color in entries
+    )
+    legend = (
+        '<div style="position:fixed;bottom:28px;left:28px;z-index:9999;'
+        'background:white;padding:10px 12px;border:1px solid #aaa;border-radius:4px;'
+        'font-size:13px;box-shadow:0 1px 4px rgba(0,0,0,.25)">'
+        f"<strong>{html.escape(title)}</strong>{items}</div>"
+    )
+    m.get_root().html.add_child(folium.Element(legend))
+
+
+def make_map(results: gpd.GeoDataFrame, color_mode: str = "Süsinikuvaru"):
     if results.empty:
         return folium.Map(location=[58.6, 25.0], zoom_start=7)
 
@@ -623,15 +657,43 @@ def make_map(results: gpd.GeoDataFrame):
             results["_date_col"].dropna().iloc[0] if results["_date_col"].notna().any() else None
         )
 
-    def color(v):
+    def carbon_color(v):
         if pd.isna(v):
-            return "#777777"
+            return MISSING_MAP_COLOR
         if v <= q1:
             return "#2ca25f"
         if v <= q2:
             return "#fec44f"
         return "#de2d26"
 
+    cutting_types = []
+    if harvest_col:
+        cutting_types = sorted(
+            {str(value).strip() for value in results[harvest_col].dropna() if str(value).strip()}
+        )
+    cutting_type_colors = {
+        value: CUTTING_TYPE_COLORS[index % len(CUTTING_TYPE_COLORS)]
+        for index, value in enumerate(cutting_types)
+    }
+
+    if color_mode == "Raieliik":
+        legend_entries = [(value, cutting_type_colors[value]) for value in cutting_types]
+        if not harvest_col or results[harvest_col].isna().any():
+            legend_entries.append(("Puudub / teadmata", MISSING_MAP_COLOR))
+        _add_map_legend(m, "Raieliik", legend_entries)
+    else:
+        _add_map_legend(
+            m,
+            "Elusbiomassi süsinikuvaru",
+            [
+                (f"Madal (≤ {fmt_num(q1, 0)} t CO₂e)", "#2ca25f"),
+                (f"Keskmine (≤ {fmt_num(q2, 0)} t CO₂e)", "#fec44f"),
+                (f"Kõrge (> {fmt_num(q2, 0)} t CO₂e)", "#de2d26"),
+                ("Puudub / teadmata", MISSING_MAP_COLOR),
+            ],
+        )
+
+    features = []
     for _, row in results.iterrows():
         popup = [
             f"<b>Metsateatis</b>: {row.get(id_col, '–') if id_col else '–'}",
@@ -661,23 +723,53 @@ def make_map(results: gpd.GeoDataFrame):
         if date_col and date_col in row:
             popup.insert(1, f"Kuupäev: {row.get(date_col, '–')}")
 
-        feature_color = color(row.get("standing_live_biomass_tco2"))
+        if color_mode == "Raieliik" and harvest_col:
+            harvest_type = row.get(harvest_col)
+            feature_color = (
+                cutting_type_colors.get(str(harvest_type).strip(), MISSING_MAP_COLOR)
+                if pd.notna(harvest_type) and str(harvest_type).strip()
+                else MISSING_MAP_COLOR
+            )
+        elif color_mode == "Raieliik":
+            feature_color = MISSING_MAP_COLOR
+        else:
+            feature_color = carbon_color(row.get("standing_live_biomass_tco2"))
         tooltip = (
             "Elusbiomassi süsinikuvaru "
             f"{fmt_num(row.get('standing_live_biomass_tco2'), 0)} t CO₂e · "
             f"{row.get('dominant_species', '–')}"
         )
-        folium.GeoJson(
-            row.geometry.__geo_interface__,
-            style_function=lambda _, c=feature_color: {
-                "color": c,
-                "weight": 2,
-                "fillColor": c,
-                "fillOpacity": 0.45,
-            },
-            tooltip=tooltip,
-            popup=folium.Popup("<br>".join(popup), max_width=380),
-        ).add_to(m)
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": row.geometry.__geo_interface__,
+                "properties": {
+                    "_color": feature_color,
+                    "_tooltip": tooltip,
+                    "_popup": "<br>".join(popup),
+                },
+            }
+        )
+
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        style_function=lambda feature: {
+            "color": feature["properties"]["_color"],
+            "weight": 2,
+            "fillColor": feature["properties"]["_color"],
+            "fillOpacity": 0.45,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["_tooltip"], aliases=[""], labels=False),
+        popup=folium.GeoJsonPopup(
+            fields=["_popup"],
+            aliases=[""],
+            labels=False,
+            max_width=380,
+            style=(
+                "background-color: white; color: #333; font-family: arial; font-size: 12px;"
+            ),
+        ),
+    ).add_to(m)
     return m
 
 
@@ -698,11 +790,12 @@ with st.sidebar:
     max_notices = st.number_input(
         "Maksimaalne kirjete arv kihist",
         min_value=100,
-        max_value=50000,
+        max_value=100000,
         value=5000,
         step=100,
     )
     run = st.button("Laadi ja arvuta", type="primary", use_container_width=True)
+    force_recalculation = st.checkbox("Arvuta uuesti (eirab salvestatud tulemust)")
     refresh_data = st.button("Värskenda lähteandmeid", use_container_width=True)
     st.divider()
     st.markdown("**Süsiniku MVP**")
@@ -725,54 +818,79 @@ if start > end:
 
 if run:
     try:
-        with st.status("Laen Metsaregistri andmeid…", expanded=True) as status:
-            st.write("1/4 Metsateatised…")
-            notices = load_notices(start, end, int(max_notices))
-            if notices.empty:
-                status.update(label="Valmis", state="complete")
-                st.warning("Valitud perioodil metsateatisi ei leitud.")
-                st.stop()
+        cached_analysis = read_analysis_cache(
+            start,
+            end,
+            int(max_notices),
+            ANALYSIS_MODEL_VERSION,
+            bypass=force_recalculation,
+            cache_root=DEFAULT_CACHE_ROOT,
+        )
+        if cached_analysis is not None:
+            results, species_df = cached_analysis
+            st.success("Laaditud salvestatud arvutustulemus.")
+        else:
+            with st.status("Laen Metsaregistri andmeid…", expanded=True) as status:
+                st.write("1/4 Metsateatised…")
+                notices = load_notices(start, end, int(max_notices))
+                if notices.empty:
+                    status.update(label="Valmis", state="complete")
+                    st.warning("Valitud perioodil metsateatisi ei leitud.")
+                    st.stop()
 
-            st.write(f"2/4 Leitud {len(notices)} teatist. Laen eraldised pakkidena…")
-            stand_progress = st.progress(0.0, text="Valmistan eraldiste päringuid ette…")
+                st.write(f"2/4 Leitud {len(notices)} teatist. Laen eraldised pakkidena…")
+                stand_progress = st.progress(0.0, text="Valmistan eraldiste päringuid ette…")
 
-            def update_stand_progress(completed, total, stage):
-                stage_name = "täpsed päringud" if stage == "exact" else "bbox-varupäringud"
-                ratio = completed / total if total else 1.0
-                stand_progress.progress(
-                    ratio,
-                    text=f"Eraldised: {stage_name} {completed}/{total}",
+                def update_stand_progress(completed, total, stage):
+                    stage_name = "täpsed päringud" if stage == "exact" else "bbox-varupäringud"
+                    ratio = completed / total if total else 1.0
+                    stand_progress.progress(
+                        ratio,
+                        text=f"Eraldised: {stage_name} {completed}/{total}",
+                    )
+
+                stands = resolve_stands_for_notices(
+                    notices,
+                    exact_loader=load_stands_for_filter,
+                    bbox_loader=load_stands_for_bbox,
+                    batch_size=50,
+                    progress_callback=update_stand_progress,
                 )
-
-            stands = resolve_stands_for_notices(
-                notices,
-                exact_loader=load_stands_for_filter,
-                bbox_loader=load_stands_for_bbox,
-                batch_size=50,
-                progress_callback=update_stand_progress,
-            )
-            stand_progress.empty()
-            st.write(
-                f"3/4 Leitud {len(stands)} eraldist. Küsin ainult kattuvate eraldiste detailid…"
-            )
-            detail_progress = st.progress(0.0, text="Valmistan detailpäringuid ette…")
-
-            def update_detail_progress(completed, total):
-                ratio = completed / total if total else 1.0
-                detail_progress.progress(
-                    ratio,
-                    text=f"Eraldiste detailid: {completed}/{total}",
+                stand_progress.empty()
+                st.write(
+                    f"3/4 Leitud {len(stands)} eraldist. "
+                    "Küsin ainult kattuvate eraldiste detailid…"
                 )
+                detail_progress = st.progress(0.0, text="Valmistan detailpäringuid ette…")
 
-            results, species_df = analyze(
-                notices,
-                stands,
-                detail_progress_callback=update_detail_progress,
-            )
-            detail_progress.empty()
-            st.write("4/4 Koondan puuliigipõhise süsiniku ja kaardi…")
-            status.update(label="Arvutus valmis", state="complete")
+                def update_detail_progress(completed, total):
+                    ratio = completed / total if total else 1.0
+                    detail_progress.progress(
+                        ratio,
+                        text=f"Eraldiste detailid: {completed}/{total}",
+                    )
 
+                results, species_df = analyze(
+                    notices,
+                    stands,
+                    detail_progress_callback=update_detail_progress,
+                )
+                detail_progress.empty()
+                st.write("4/4 Koondan puuliigipõhise süsiniku ja kaardi…")
+                status.update(label="Arvutus valmis", state="complete")
+
+            try:
+                write_analysis_cache(
+                    start,
+                    end,
+                    int(max_notices),
+                    ANALYSIS_MODEL_VERSION,
+                    results,
+                    species_df,
+                    cache_root=DEFAULT_CACHE_ROOT,
+                )
+            except Exception as cache_error:
+                st.warning(f"Arvutus õnnestus, kuid tulemust ei saanud salvestada: {cache_error}")
         st.session_state["results"] = results
         st.session_state["species_df"] = species_df
     except Exception as e:
@@ -873,7 +991,13 @@ if "results" in st.session_state:
     tab1, tab2, tab3, tab4 = st.tabs(["Kaart", "Koond", "Puuliigid", "Andmed"])
 
     with tab1:
-        st_folium(make_map(results), use_container_width=True, height=650, returned_objects=[])
+        map_color_mode = st.selectbox("Kaardi värv", MAP_COLOR_MODES)
+        st_folium(
+            make_map(results, color_mode=map_color_mode),
+            use_container_width=True,
+            height=650,
+            returned_objects=[],
+        )
 
     with tab2:
         left, right = st.columns(2)
