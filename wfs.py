@@ -28,6 +28,7 @@ def fetch_wfs_features(
     cache_root: Path | None = None,
     cache_max_age: timedelta = timedelta(hours=24),
     force_refresh: bool = False,
+    page_progress: Callable[[int, int, int], None] | None = None,
 ) -> list[dict]:
     """Fetch WFS features in bounded pages, retrying transient read timeouts."""
     features: list[dict] = []
@@ -42,9 +43,10 @@ def fetch_wfs_features(
             "outputFormat": "application/json",
             "srsName": "EPSG:4326",
         }
-        if max_features is not None:
-            params["count"] = min(page_size, max_features - len(features))
-            params["startIndex"] = start_index
+        remaining = None if max_features is None else max_features - len(features)
+        requested_count = page_size if remaining is None else min(page_size, remaining)
+        params["count"] = requested_count
+        params["startIndex"] = start_index
         if cql_filter:
             params["CQL_FILTER"] = cql_filter
         if bbox:
@@ -79,8 +81,9 @@ def fetch_wfs_features(
         page = document.get("features", [])
         features.extend(page)
 
-        requested_count = params.get("count")
-        if max_features is None or not page or len(page) < requested_count:
+        if page_progress:
+            page_progress(start_index // page_size + 1, len(page), len(features))
+        if not page or len(page) < requested_count:
             break
         start_index += len(page)
 

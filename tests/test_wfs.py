@@ -1,4 +1,4 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import requests
 
@@ -35,6 +35,45 @@ def test_fetch_wfs_features_paginates_large_requests():
         2,
         4,
     ]
+
+
+def test_fetch_wfs_features_paginates_until_short_page_when_unbounded():
+    request_get = Mock(
+        side_effect=[
+            response_with_features(1, 2),
+            response_with_features(3, 4),
+            response_with_features(5),
+        ]
+    )
+
+    features = fetch_wfs_features(
+        "metsaregister:teatis_arhiiv",
+        max_features=None,
+        page_size=2,
+        request_get=request_get,
+    )
+
+    assert [feature["id"] for feature in features] == [1, 2, 3, 4, 5]
+    assert [call.kwargs["params"]["startIndex"] for call in request_get.call_args_list] == [
+        0,
+        2,
+        4,
+    ]
+
+
+def test_fetch_wfs_features_reports_completed_pages():
+    progress = Mock()
+    request_get = Mock(side_effect=[response_with_features(1, 2), response_with_features(3)])
+
+    fetch_wfs_features(
+        "metsaregister:teatis_arhiiv",
+        max_features=None,
+        page_size=2,
+        request_get=request_get,
+        page_progress=progress,
+    )
+
+    assert progress.call_args_list == [call(1, 2, 2), call(2, 1, 3)]
 
 
 def test_fetch_wfs_features_retries_timed_out_page():
