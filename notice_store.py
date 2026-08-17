@@ -127,13 +127,74 @@ def _utc_timestamp(now: datetime | None) -> datetime:
 
 
 def _write_manifest(root: Path, manifest: dict) -> None:
+    temporary_path = _prepare_manifest(root, manifest)
+    try:
+        temporary_path.replace(root / "manifest.json")
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _prepare_manifest(root: Path, manifest: dict) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=root, prefix="manifest-", suffix=".json", delete=False
     ) as temporary:
         json.dump(manifest, temporary, indent=2, sort_keys=True)
-        temporary_path = Path(temporary.name)
-    temporary_path.replace(root / "manifest.json")
+        return Path(temporary.name)
+
+
+def _deduplication_keys(frame: gpd.GeoDataFrame, identity_field: str) -> list[tuple]:
+    geometry_keys = frame.geometry.to_wkb().tolist()
+    if identity_field == "geometry_wkb":
+        return [
+            ("geometry_wkb", geometry_key) if geometry_key is not None else ("row", index)
+            for index, geometry_key in enumerate(geometry_keys)
+        ]
+
+    return [
+        ("identity", value)
+        if not pd.isna(value)
+        else (("geometry_wkb", geometry_key) if geometry_key is not None else ("row", index))
+        for index, (value, geometry_key) in enumerate(
+            zip(frame[identity_field], geometry_keys, strict=True)
+        )
+    ]
+
+
+def _publish_partition_and_manifest(
+    destination: Path,
+    temporary_partition: Path,
+    root: Path,
+    manifest: dict,
+) -> None:
+    """Publish partition and manifest together, restoring the old partition on failure."""
+    backup_partition = destination.parent / f"notices-{uuid4().hex}.previous.parquet"
+    had_destination = destination.exists()
+    published_partition = False
+    temporary_manifest: Path | None = None
+
+    try:
+        temporary_manifest = _prepare_manifest(root, manifest)
+        if had_destination:
+            destination.replace(backup_partition)
+        temporary_partition.replace(destination)
+        published_partition = True
+        temporary_manifest.replace(root / "manifest.json")
+    except Exception:
+        if published_partition and destination.exists():
+            destination.unlink()
+        if backup_partition.exists():
+            backup_partition.replace(destination)
+        raise
+    else:
+        if backup_partition.exists():
+            backup_partition.unlink()
+    finally:
+        if temporary_partition.exists():
+            temporary_partition.unlink()
+        if temporary_manifest is not None and temporary_manifest.exists():
+            temporary_manifest.unlink()
 
 
 def upsert_partition(
@@ -156,28 +217,13 @@ def upsert_partition(
     merged = gpd.GeoDataFrame(
         pd.concat(frames, ignore_index=True, sort=False), geometry="geometry", crs="EPSG:4326"
     )
-    temporary_identity = identity_field == "geometry_wkb"
-    if temporary_identity:
-        merged[identity_field] = merged.geometry.to_wkb()
-    merged = merged.drop_duplicates(subset=[identity_field], keep="last")
-    if temporary_identity:
-        merged = merged.drop(columns=[identity_field])
+    temporary_identity = "__notice_store_identity__"
+    while temporary_identity in merged.columns:
+        temporary_identity = f"_{temporary_identity}"
+    merged[temporary_identity] = _deduplication_keys(merged, identity_field)
+    merged = merged.drop_duplicates(subset=[temporary_identity], keep="last")
+    merged = merged.drop(columns=[temporary_identity])
     merged = gpd.GeoDataFrame(merged, geometry="geometry", crs="EPSG:4326")
-
-    temporary_partition = destination.parent / f"notices-{uuid4().hex}.parquet"
-    try:
-        merged.to_parquet(temporary_partition)
-        verified = gpd.read_parquet(temporary_partition)
-        if (
-            len(verified) != len(merged)
-            or verified.crs is None
-            or not verified.crs.equals("EPSG:4326")
-        ):
-            raise ValueError("temporary GeoParquet validation failed")
-        temporary_partition.replace(destination)
-    finally:
-        if temporary_partition.exists():
-            temporary_partition.unlink()
 
     observed_start, observed_end = _observed_bounds(merged)
     timestamp = _utc_timestamp(now)
@@ -194,7 +240,22 @@ def upsert_partition(
         "schema_fingerprint": _schema_fingerprint(merged),
         "updated_at": timestamp.isoformat(),
     }
-    _write_manifest(root, manifest)
+
+    temporary_partition = destination.parent / f"notices-{uuid4().hex}.parquet"
+    try:
+        merged.to_parquet(temporary_partition)
+        verified = gpd.read_parquet(temporary_partition)
+        if (
+            len(verified) != len(merged)
+            or verified.crs is None
+            or not verified.crs.equals("EPSG:4326")
+        ):
+            raise ValueError("temporary GeoParquet validation failed")
+    except Exception:
+        if temporary_partition.exists():
+            temporary_partition.unlink()
+        raise
+    _publish_partition_and_manifest(destination, temporary_partition, root, manifest)
     return len(merged)
 
 

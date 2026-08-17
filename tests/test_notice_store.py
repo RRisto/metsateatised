@@ -5,6 +5,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import Point
 
+import notice_store
 from notice_store import (
     PartitionKey,
     is_partition_complete,
@@ -96,6 +97,57 @@ def test_upsert_failure_preserves_existing_partition_and_manifest(tmp_path: Path
 
     assert partition_path(tmp_path, key).read_bytes() == partition_bytes
     assert (tmp_path / "manifest.json").read_bytes() == manifest_bytes
+
+
+def test_manifest_write_failure_preserves_existing_partition_and_manifest(
+    tmp_path: Path, monkeypatch
+):
+    key = PartitionKey("archive_notices", 2025, 3)
+    original = notice_frame(
+        [{"teatis_id": 1, "otsus": "old", "geometry": Point(24.0, 59.0)}]
+    )
+    refreshed = notice_frame(
+        [{"teatis_id": 1, "otsus": "new", "geometry": Point(24.0, 59.0)}]
+    )
+    upsert_partition(tmp_path, key, original, identity_candidates=["teatis_id"])
+    partition_bytes = partition_path(tmp_path, key).read_bytes()
+    manifest_bytes = (tmp_path / "manifest.json").read_bytes()
+
+    def fail_manifest_serialization(*args, **kwargs):
+        raise OSError("simulated manifest write failure")
+
+    monkeypatch.setattr(notice_store.json, "dump", fail_manifest_serialization)
+
+    with pytest.raises(OSError, match="simulated manifest write failure"):
+        upsert_partition(tmp_path, key, refreshed, identity_candidates=["teatis_id"])
+
+    assert partition_path(tmp_path, key).read_bytes() == partition_bytes
+    assert (tmp_path / "manifest.json").read_bytes() == manifest_bytes
+    assert is_partition_complete(tmp_path, key)
+
+
+def test_upsert_uses_geometry_for_rows_with_missing_identity_values(tmp_path: Path):
+    key = PartitionKey("archive_notices", 2025, 3)
+    first = notice_frame(
+        [
+            {"teatis_id": None, "otsus": "north", "geometry": Point(24.0, 59.0)},
+            {"otsus": "west", "geometry": Point(25.0, 58.0)},
+            {"teatis_id": 1, "otsus": "old", "geometry": Point(26.0, 57.0)},
+        ]
+    )
+    refreshed = notice_frame(
+        [
+            {"teatis_id": None, "otsus": "south", "geometry": Point(27.0, 56.0)},
+            {"teatis_id": 1, "otsus": "new", "geometry": Point(26.0, 57.0)},
+        ]
+    )
+
+    count = upsert_partition(tmp_path, key, first, identity_candidates=["teatis_id"])
+    count = upsert_partition(tmp_path, key, refreshed, identity_candidates=["teatis_id"])
+    stored = gpd.read_parquet(partition_path(tmp_path, key))
+
+    assert count == 4
+    assert set(stored["otsus"]) == {"north", "west", "south", "new"}
 
 
 def test_summarize_store_uses_completed_manifest_entries(tmp_path: Path):
