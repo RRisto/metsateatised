@@ -61,15 +61,20 @@ def synchronize_notices(
 
     for interval in split_month_intervals(start, end):
         month = date(interval.start.year, interval.start.month, 1)
+        next_month = date(
+            month.year + (month.month == 12),
+            1 if month.month == 12 else month.month + 1,
+            1,
+        )
+        refresh_required = (
+            refresh_completed or interval.start != month or interval.end_exclusive != next_month
+        )
         for layer, type_name in NOTICE_LAYERS.items():
             partition = PartitionKey(layer, month.year, month.month)
             partition_label = f"{layer}/{month:%Y-%m}"
             date_column = date_columns.get(layer)
             if date_column is None:
                 failed_partitions.append(f"{partition_label}: missing date column")
-                continue
-            if not refresh_completed and is_partition_complete(root, partition):
-                skipped_partitions += 1
                 continue
 
             def page_progress(
@@ -92,15 +97,19 @@ def synchronize_notices(
                     )
 
             try:
+                if not refresh_required and is_partition_complete(root, partition):
+                    skipped_partitions += 1
+                    continue
                 cql_filter = (
-                    f"{date_column} >= '{interval.start.isoformat()}' "
-                    f"AND {date_column} < '{interval.end_exclusive.isoformat()}'"
+                    f"{date_column} >= '{month.isoformat()}' "
+                    f"AND {date_column} < '{next_month.isoformat()}'"
                 )
                 features = fetcher(
                     type_name,
                     max_features=None,
                     cql_filter=cql_filter,
                     cache_root=DEFAULT_CACHE_ROOT,
+                    force_refresh=refresh_required,
                     page_progress=page_progress,
                 )
                 if features:
