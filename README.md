@@ -51,15 +51,18 @@ iga teatise kohta. Rakendus näitab eraldisepakkide ja detailvastuste edenemist.
 
 ## Metsateatiste ajalooline sünkroonimine
 
-Külgriba **Sünkroniseeri toormetsateatised** töövoog laadib Metsaregistri WFS-ist
-toored kehtivad ja arhiveeritud metsateatised eraldi püsivasse andmehoidlasse.
+Külgriba jaotises **Metsateatiste andmete sünkroonimine** käivita töövoog nupuga
+**Laadi/uuenda metsateatised**. See laadib Metsaregistri WFS-ist toored kehtivad
+ja arhiveeritud metsateatised eraldi püsivasse andmehoidlasse.
 Esimesel allalaadimisel vali võimalikult pikk vajalik ajalooline kuupäevavahemik.
 Järgnevatel kordadel vali ainult juba salvestatud katvusele järgnev ajavahemik;
 valmis kuude partitsioonid jäetakse siis vahele.
 
-Juba alla laaditud kuude tahtlikuks uuendamiseks kasuta ülekattega ajavahemikku.
-See värskendab valitud kuude partitsioone, mistõttu ei ole seda vaja tavalisel
-inkrementaalsel sünkroonimisel sisse lülitada. Toorandmed paiknevad kihiti teedel
+Juba alla laaditud kuude tahtlikuks uuendamiseks vali ülekattega ajavahemik **ja**
+lülita sisse märkeruut **Uuenda ka juba laaditud kattuvaid kuid**. Ilma selle
+märkeruuduta jäetakse valmis partitsioonid ka ülekattega kuude korral vahele;
+tavalisel inkrementaalsel sünkroonimisel pole seda vaja sisse lülitada.
+Toorandmed paiknevad kihiti teedel
 `data/notices/<layer>/year=YYYY/month=MM/notices.parquet`.
 
 Sünkroonimine laadib ainult toormetsateatised. Puistu eraldiste sidumine,
