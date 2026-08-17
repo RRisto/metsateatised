@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import folium
 import geopandas as gpd
@@ -6,6 +7,8 @@ import pandas as pd
 import pytest
 from shapely.geometry import Polygon
 from streamlit.testing.v1 import AppTest
+
+from notice_sync import SyncResult
 
 
 def dashboard_result_fixture():
@@ -44,6 +47,47 @@ def dashboard_result_fixture():
 def _rendered_text(app):
     element_groups = (app.caption, app.info, app.markdown, app.subheader)
     return "\n".join(str(element.value) for group in element_groups for element in group)
+
+
+def test_dashboard_exposes_raw_notice_synchronization_controls():
+    """Removing the raw-data controls would leave store synchronization inaccessible."""
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+
+    app.run(timeout=20)
+
+    assert not app.exception
+    assert any(item.label == "Sünkroonimise algus" for item in app.date_input)
+    assert any(item.label == "Sünkroonimise lõpp" for item in app.date_input)
+    assert any(
+        item.label == "Uuenda ka juba laaditud kattuvaid kuid" for item in app.checkbox
+    )
+    assert any(item.label == "Laadi/uuenda metsateatised" for item in app.button)
+
+
+def test_raw_notice_synchronization_does_not_populate_analysis_results():
+    """Calling raw synchronization must not enter the load-and-analyze workflow."""
+    sample_feature = {
+        "type": "Feature",
+        "properties": {"kuupaev": "2026-08-01"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[24.47, 58.75], [24.48, 58.75], [24.48, 58.76], [24.47, 58.75]]],
+        },
+    }
+    with (
+        patch("notice_sync.synchronize_notices", return_value=SyncResult(0, 0, (), 0)) as sync,
+        patch("wfs.fetch_wfs_features", return_value=[sample_feature]),
+    ):
+        app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+        app.run(timeout=20)
+
+        next(
+            item for item in app.button if item.label == "Laadi/uuenda metsateatised"
+        ).click()
+        app.run(timeout=20)
+
+    sync.assert_called_once()
+    assert "results" not in app.session_state
 
 
 def test_distinct_carbon_and_inventory_metrics_reach_streamlit_dashboard():

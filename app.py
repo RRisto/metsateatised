@@ -5,6 +5,7 @@ import html
 import re
 from collections.abc import Iterable
 from datetime import date, timedelta
+from pathlib import Path
 
 import aiohttp
 import folium
@@ -17,6 +18,8 @@ import streamlit as st
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
+import notice_sync
+import wfs
 from analysis_cache import read_analysis_cache, write_analysis_cache
 from carbon import (
     VolumeBasis,
@@ -29,13 +32,13 @@ from carbon import (
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
+from notice_store import summarize_store
 from stand_model import (
     aggregate_increment,
     build_stand_record,
     classify_inventory_recency,
     classify_spatial_coverage,
 )
-from wfs import fetch_wfs_features
 
 # -----------------------------------------------------------------------------
 # Public Estonian Forest Register endpoints
@@ -49,6 +52,7 @@ LAYERS = {
 }
 INTERSECTION_AREA_TOLERANCE_M2 = 1e-6
 ANALYSIS_MODEL_VERSION = "estonia-bcef-v1"
+NOTICE_STORE_ROOT = Path("data/notices")
 
 st.set_page_config(page_title="Metsateatiste biomassi süsinik MVP", layout="wide")
 
@@ -77,7 +81,7 @@ def wfs_get(
     cql_filter: str | None = None,
     bbox: tuple[float, float, float, float] | None = None,
 ) -> gpd.GeoDataFrame:
-    feats = fetch_wfs_features(
+    feats = wfs.fetch_wfs_features(
         type_name,
         max_features=count,
         cql_filter=cql_filter,
@@ -797,6 +801,37 @@ with st.sidebar:
     run = st.button("Laadi ja arvuta", type="primary", use_container_width=True)
     force_recalculation = st.checkbox("Arvuta uuesti (eirab salvestatud tulemust)")
     refresh_data = st.button("Värskenda lähteandmeid", use_container_width=True)
+    with st.expander("Metsateatiste andmete sünkroonimine"):
+        notice_store_summary = summarize_store(NOTICE_STORE_ROOT)
+        if notice_store_summary.first_date and notice_store_summary.last_date:
+            coverage = (
+                f"{notice_store_summary.first_date:%Y-%m-%d} kuni "
+                f"{notice_store_summary.last_date:%Y-%m-%d}"
+            )
+        else:
+            coverage = "Andmeid pole veel salvestatud"
+        last_sync = (
+            notice_store_summary.last_sync_at.strftime("%Y-%m-%d %H:%M UTC")
+            if notice_store_summary.last_sync_at
+            else "Pole veel sünkroonitud"
+        )
+        st.caption(f"Salvestatud kirjeid: {notice_store_summary.total_records:,}")
+        st.caption(f"Valmis kuupartitsioone: {notice_store_summary.completed_partitions}")
+        st.caption(f"Andmete katvus: {coverage}")
+        st.caption(f"Viimane sünkroonimine: {last_sync}")
+
+        sync_default_end = date.today()
+        sync_default_start = (
+            notice_store_summary.last_date + timedelta(days=1)
+            if notice_store_summary.last_date
+            else sync_default_end - timedelta(days=3650)
+        )
+        sync_start = st.date_input("Sünkroonimise algus", value=sync_default_start)
+        sync_end = st.date_input("Sünkroonimise lõpp", value=sync_default_end)
+        refresh_completed = st.checkbox("Uuenda ka juba laaditud kattuvaid kuid")
+        synchronize_raw_notices = st.button(
+            "Laadi/uuenda metsateatised", use_container_width=True
+        )
     st.divider()
     st.markdown("**Süsiniku MVP**")
     st.caption(
@@ -811,6 +846,55 @@ if refresh_data:
     st.session_state.pop("results", None)
     st.session_state.pop("species_df", None)
     st.rerun()
+
+if synchronize_raw_notices:
+    if sync_start > sync_end:
+        st.error("Sünkroonimise algus ei tohi olla lõppkuupäevast hilisem.")
+    else:
+        try:
+            date_columns = {}
+            for layer, type_name in notice_sync.NOTICE_LAYERS.items():
+                date_column = detect_date_column(sample_layer(type_name))
+                if date_column is None:
+                    raise RuntimeError(f"Ei suutnud kihis {type_name} kuupäevavälja tuvastada")
+                date_columns[layer] = date_column
+
+            sync_progress_bar = st.progress(0.0, text="Valmistan sünkroonimist ette…")
+            sync_status = st.empty()
+
+            def update_sync_progress(event: notice_sync.SyncProgress) -> None:
+                pulse = (event.page % 12 + 1) / 12
+                sync_progress_bar.progress(
+                    pulse,
+                    text=(
+                        f"{event.layer} {event.month:%Y-%m}: leht {event.page}; "
+                        f"kokku {event.cumulative_rows} kirjet"
+                    ),
+                )
+                sync_status.caption(
+                    f"Töötlen {event.layer} kihti, kuud {event.month:%Y-%m} ja lehte {event.page}."
+                )
+
+            sync_result = notice_sync.synchronize_notices(
+                sync_start,
+                sync_end,
+                date_columns,
+                root=NOTICE_STORE_ROOT,
+                refresh_completed=refresh_completed,
+                progress=update_sync_progress,
+            )
+            sync_progress_bar.empty()
+            sync_status.empty()
+            st.success(
+                "Sünkroonimine valmis: "
+                f"alla laaditi {sync_result.downloaded_partitions} partitsiooni, "
+                f"vahele jäeti {sync_result.skipped_partitions} ja "
+                f"salvestati {sync_result.stored_records} kirjet."
+            )
+            for failed_partition in sync_result.failed_partitions:
+                st.error(f"Partitsiooni sünkroonimine ebaõnnestus: {failed_partition}")
+        except Exception as error:
+            st.error(f"Metsateatiste sünkroonimine ebaõnnestus: {error}")
 
 if start > end:
     st.error("Alguskuupäev peab olema lõppkuupäevast varasem.")
