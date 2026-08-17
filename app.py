@@ -18,6 +18,7 @@ import streamlit as st
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
+import notice_store
 import notice_sync
 import wfs
 from analysis_cache import read_analysis_cache, write_analysis_cache
@@ -32,7 +33,6 @@ from carbon import (
 )
 from data_cache import DEFAULT_CACHE_ROOT, clear_data_cache, read_json_cache, write_json_cache
 from forest_data import load_stands_for_notices as resolve_stands_for_notices
-from notice_store import summarize_store
 from stand_model import (
     aggregate_increment,
     build_stand_record,
@@ -55,6 +55,39 @@ ANALYSIS_MODEL_VERSION = "estonia-bcef-v1"
 NOTICE_STORE_ROOT = Path("data/notices")
 
 st.set_page_config(page_title="Metsateatiste biomassi süsinik MVP", layout="wide")
+
+
+def default_notice_sync_start(sync_end: date, last_stored_date: date | None) -> date:
+    """Choose the first missing day, or the same calendar day ten years earlier."""
+    if last_stored_date is not None:
+        return last_stored_date + timedelta(days=1)
+    try:
+        return sync_end.replace(year=sync_end.year - 10)
+    except ValueError:
+        return sync_end.replace(year=sync_end.year - 10, day=28)
+
+
+def notice_sync_progress_pulse(page: int) -> float:
+    """Show activity without implying an unknown final page count."""
+    return ((page - 1) % 11 + 1) / 12
+
+
+def render_notice_store_summary(container, summary: notice_store.StoreSummary) -> None:
+    """Render the currently durable raw-notice store state into one placeholder."""
+    if summary.first_date and summary.last_date:
+        coverage = f"{summary.first_date:%Y-%m-%d} kuni {summary.last_date:%Y-%m-%d}"
+    else:
+        coverage = "Andmeid pole veel salvestatud"
+    last_sync = (
+        summary.last_sync_at.strftime("%Y-%m-%d %H:%M UTC")
+        if summary.last_sync_at
+        else "Pole veel sünkroonitud"
+    )
+    with container.container():
+        st.caption(f"Salvestatud kirjeid: {summary.total_records:,}")
+        st.caption(f"Valmis kuupartitsioone: {summary.completed_partitions}")
+        st.caption(f"Andmete katvus: {coverage}")
+        st.caption(f"Viimane sünkroonimine: {last_sync}")
 
 
 def _clean_col(s: str) -> str:
@@ -802,29 +835,13 @@ with st.sidebar:
     force_recalculation = st.checkbox("Arvuta uuesti (eirab salvestatud tulemust)")
     refresh_data = st.button("Värskenda lähteandmeid", use_container_width=True)
     with st.expander("Metsateatiste andmete sünkroonimine"):
-        notice_store_summary = summarize_store(NOTICE_STORE_ROOT)
-        if notice_store_summary.first_date and notice_store_summary.last_date:
-            coverage = (
-                f"{notice_store_summary.first_date:%Y-%m-%d} kuni "
-                f"{notice_store_summary.last_date:%Y-%m-%d}"
-            )
-        else:
-            coverage = "Andmeid pole veel salvestatud"
-        last_sync = (
-            notice_store_summary.last_sync_at.strftime("%Y-%m-%d %H:%M UTC")
-            if notice_store_summary.last_sync_at
-            else "Pole veel sünkroonitud"
-        )
-        st.caption(f"Salvestatud kirjeid: {notice_store_summary.total_records:,}")
-        st.caption(f"Valmis kuupartitsioone: {notice_store_summary.completed_partitions}")
-        st.caption(f"Andmete katvus: {coverage}")
-        st.caption(f"Viimane sünkroonimine: {last_sync}")
+        notice_summary_placeholder = st.empty()
+        notice_store_summary = notice_store.summarize_store(NOTICE_STORE_ROOT)
+        render_notice_store_summary(notice_summary_placeholder, notice_store_summary)
 
         sync_default_end = date.today()
-        sync_default_start = (
-            notice_store_summary.last_date + timedelta(days=1)
-            if notice_store_summary.last_date
-            else sync_default_end - timedelta(days=3650)
+        sync_default_start = default_notice_sync_start(
+            sync_default_end, notice_store_summary.last_date
         )
         sync_start = st.date_input("Sünkroonimise algus", value=sync_default_start)
         sync_end = st.date_input("Sünkroonimise lõpp", value=sync_default_end)
@@ -852,39 +869,50 @@ if synchronize_raw_notices:
         st.error("Sünkroonimise algus ei tohi olla lõppkuupäevast hilisem.")
     else:
         try:
-            date_columns = {}
-            for layer, type_name in notice_sync.NOTICE_LAYERS.items():
-                date_column = detect_date_column(sample_layer(type_name))
-                if date_column is None:
-                    raise RuntimeError(f"Ei suutnud kihis {type_name} kuupäevavälja tuvastada")
-                date_columns[layer] = date_column
+            sync_progress_bar = None
+            sync_status = None
+            try:
+                date_columns = {}
+                for layer, type_name in notice_sync.NOTICE_LAYERS.items():
+                    date_column = detect_date_column(sample_layer(type_name))
+                    if date_column is None:
+                        raise RuntimeError(f"Ei suutnud kihis {type_name} kuupäevavälja tuvastada")
+                    date_columns[layer] = date_column
 
-            sync_progress_bar = st.progress(0.0, text="Valmistan sünkroonimist ette…")
-            sync_status = st.empty()
+                sync_progress_bar = st.progress(0.0, text="Valmistan sünkroonimist ette…")
+                sync_status = st.empty()
 
-            def update_sync_progress(event: notice_sync.SyncProgress) -> None:
-                pulse = (event.page % 12 + 1) / 12
-                sync_progress_bar.progress(
-                    pulse,
-                    text=(
-                        f"{event.layer} {event.month:%Y-%m}: leht {event.page}; "
-                        f"kokku {event.cumulative_rows} kirjet"
-                    ),
+                def update_sync_progress(event: notice_sync.SyncProgress) -> None:
+                    pulse = notice_sync_progress_pulse(event.page)
+                    sync_progress_bar.progress(
+                        pulse,
+                        text=(
+                            f"{event.layer} {event.month:%Y-%m}: leht {event.page}; "
+                            f"kokku {event.cumulative_rows} kirjet"
+                        ),
+                    )
+                    sync_status.caption(
+                        f"Töötlen {event.layer} kihti, kuud {event.month:%Y-%m} "
+                        f"ja lehte {event.page}."
+                    )
+
+                sync_result = notice_sync.synchronize_notices(
+                    sync_start,
+                    sync_end,
+                    date_columns,
+                    root=NOTICE_STORE_ROOT,
+                    refresh_completed=refresh_completed,
+                    progress=update_sync_progress,
                 )
-                sync_status.caption(
-                    f"Töötlen {event.layer} kihti, kuud {event.month:%Y-%m} ja lehte {event.page}."
-                )
+                updated_notice_store_summary = notice_store.summarize_store(NOTICE_STORE_ROOT)
+            finally:
+                if sync_progress_bar is not None:
+                    sync_progress_bar.empty()
+                if sync_status is not None:
+                    sync_status.empty()
 
-            sync_result = notice_sync.synchronize_notices(
-                sync_start,
-                sync_end,
-                date_columns,
-                root=NOTICE_STORE_ROOT,
-                refresh_completed=refresh_completed,
-                progress=update_sync_progress,
-            )
-            sync_progress_bar.empty()
-            sync_status.empty()
+            notice_summary_placeholder.empty()
+            render_notice_store_summary(notice_summary_placeholder, updated_notice_store_summary)
             st.success(
                 "Sünkroonimine valmis: "
                 f"alla laaditi {sync_result.downloaded_partitions} partitsiooni, "

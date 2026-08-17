@@ -1,3 +1,4 @@
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,7 +9,8 @@ import pytest
 from shapely.geometry import Polygon
 from streamlit.testing.v1 import AppTest
 
-from notice_sync import SyncResult
+from notice_store import StoreSummary
+from notice_sync import SyncProgress, SyncResult
 
 
 def dashboard_result_fixture():
@@ -47,6 +49,83 @@ def dashboard_result_fixture():
 def _rendered_text(app):
     element_groups = (app.caption, app.info, app.markdown, app.subheader)
     return "\n".join(str(element.value) for group in element_groups for element in group)
+
+
+def raw_sync_sample_feature():
+    return {
+        "type": "Feature",
+        "properties": {"kuupaev": "2026-08-01"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[24.47, 58.75], [24.48, 58.75], [24.48, 58.76], [24.47, 58.75]]],
+        },
+    }
+
+
+def test_empty_store_sync_start_is_ten_calendar_years_earlier_on_leap_day():
+    """Fixed-day subtraction picks 2014-03-01 instead of the required calendar date."""
+    import app as dashboard_app
+
+    assert dashboard_app.default_notice_sync_start(date(2024, 2, 29), None) == date(2014, 2, 28)
+
+
+def test_notice_sync_progress_pulse_never_claims_completion():
+    """A full progress bar falsely implies a partition completed when its page total is unknown."""
+    import app as dashboard_app
+
+    assert 0.0 < dashboard_app.notice_sync_progress_pulse(11) < 1.0
+
+
+def test_raw_sync_renders_the_updated_store_summary():
+    """Retaining the initial summary after a sync shows stale coverage and record totals."""
+    initial_summary = StoreSummary(0, 0, None, None, None)
+    updated_summary = StoreSummary(
+        7,
+        2,
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+        datetime(2026, 2, 1, tzinfo=UTC),
+    )
+    with (
+        patch(
+            "notice_store.summarize_store",
+            side_effect=[initial_summary, initial_summary, updated_summary],
+        ) as summarize,
+        patch("notice_sync.synchronize_notices", return_value=SyncResult(2, 0, (), 7)),
+        patch("wfs.fetch_wfs_features", return_value=[raw_sync_sample_feature()]),
+    ):
+        app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+        app.run(timeout=20)
+        next(item for item in app.button if item.label == "Laadi/uuenda metsateatised").click()
+        app.run(timeout=20)
+
+    assert summarize.call_count == 3
+    assert "Salvestatud kirjeid: 7" in _rendered_text(app)
+    assert "Valmis kuupartitsioone: 2" in _rendered_text(app)
+
+
+def test_raw_sync_failure_clears_progress_and_status_containers():
+    """A service failure must not leave the transient processing UI visible."""
+
+    def fail_after_progress(*args, **kwargs):
+        kwargs["progress"](
+            SyncProgress("archive_notices", date(2026, 1, 1), 1, 10, 10)
+        )
+        raise RuntimeError("test synchronization failure")
+
+    with (
+        patch("notice_sync.synchronize_notices", side_effect=fail_after_progress),
+        patch("wfs.fetch_wfs_features", return_value=[raw_sync_sample_feature()]),
+    ):
+        app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+        app.run(timeout=20)
+        next(item for item in app.button if item.label == "Laadi/uuenda metsateatised").click()
+        app.run(timeout=20)
+
+    assert not app.get("progress")
+    assert "Töötlen archive_notices kihti" not in _rendered_text(app)
+    assert not app.exception
+    assert any("test synchronization failure" in error.value for error in app.error)
 
 
 def test_dashboard_exposes_raw_notice_synchronization_controls():
