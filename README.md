@@ -49,6 +49,24 @@ vastet ei leita, kasutatakse ainult selle teatise väikest ruumilist bbox-pärin
 Unikaalsed eraldiseviited saadetakse WFS-i kuni 50 viite kaupa, mitte ühe päringuna
 iga teatise kohta. Rakendus näitab eraldisepakkide ja detailvastuste edenemist.
 
+## Metsateatiste ajalooline sünkroonimine
+
+Külgriba **Sünkroniseeri toormetsateatised** töövoog laadib Metsaregistri WFS-ist
+toored kehtivad ja arhiveeritud metsateatised eraldi püsivasse andmehoidlasse.
+Esimesel allalaadimisel vali võimalikult pikk vajalik ajalooline kuupäevavahemik.
+Järgnevatel kordadel vali ainult juba salvestatud katvusele järgnev ajavahemik;
+valmis kuude partitsioonid jäetakse siis vahele.
+
+Juba alla laaditud kuude tahtlikuks uuendamiseks kasuta ülekattega ajavahemikku.
+See värskendab valitud kuude partitsioone, mistõttu ei ole seda vaja tavalisel
+inkrementaalsel sünkroonimisel sisse lülitada. Toorandmed paiknevad kihiti teedel
+`data/notices/<layer>/year=YYYY/month=MM/notices.parquet`.
+
+Sünkroonimine laadib ainult toormetsateatised. Puistu eraldiste sidumine,
+biomassi arvutamine ning ühine suuremahuline visualiseerimine on eraldi töö ja
+ei käivitu selle toiminguga. Lühiajalise `data/cache` kustutamine ei kustuta
+püsivat metsateatiste andmehoidlat `data/notices`.
+
 ## Andmeallikad
 
 Metsaregistri GeoServer WFS:
