@@ -15,6 +15,34 @@ from data_cache import read_json_cache, write_json_cache
 WFS_URL = "https://gsavalik.envir.ee/geoserver/metsaregister/ows"
 
 
+def _optional_response_count(document: dict, field: str) -> int | None:
+    value = document.get(field)
+    if value is None or value == "unknown":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"WFS response has invalid {field}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"WFS response has invalid {field}") from error
+    if parsed < 0:
+        raise ValueError(f"WFS response has invalid {field}")
+    return parsed
+
+
+def _validated_feature_page(document: object) -> tuple[list[dict], int | None]:
+    if not isinstance(document, dict) or document.get("type") != "FeatureCollection":
+        raise ValueError("WFS response is not a GeoJSON FeatureCollection")
+    page = document.get("features")
+    if not isinstance(page, list):
+        raise ValueError("WFS response is not a GeoJSON FeatureCollection with a features list")
+
+    number_returned = _optional_response_count(document, "numberReturned")
+    if number_returned is not None and number_returned != len(page):
+        raise ValueError("WFS response numberReturned does not match its features list")
+    return page, _optional_response_count(document, "numberMatched")
+
+
 def fetch_wfs_features(
     type_name: str,
     *,
@@ -33,6 +61,7 @@ def fetch_wfs_features(
     """Fetch WFS features in bounded pages, retrying transient read timeouts."""
     features: list[dict] = []
     start_index = 0
+    page_number = 0
 
     while max_features is None or len(features) < max_features:
         params: dict[str, str | int] = {
@@ -73,17 +102,32 @@ def fetch_wfs_features(
                         raise
                     sleep(2**attempt)
             document = response.json()
+            page, number_matched = _validated_feature_page(document)
             if cache_root is not None:
                 write_json_cache("wfs", cache_key, document, cache_root=cache_root)
         else:
             document = cached
+            page, number_matched = _validated_feature_page(document)
 
-        page = document.get("features", [])
-        features.extend(page)
+        included_page = page[:requested_count]
+        features.extend(included_page)
+        page_number += 1
 
         if page_progress:
-            page_progress(start_index // page_size + 1, len(page), len(features))
-        if not page or len(page) < requested_count:
+            page_progress(page_number, len(included_page), len(features))
+
+        bounded_complete = max_features is not None and len(features) >= max_features
+        matched_complete = number_matched is not None and len(features) >= min(
+            number_matched,
+            max_features if max_features is not None else number_matched,
+        )
+        if bounded_complete or matched_complete:
+            break
+        if not page:
+            if number_matched is not None and len(features) < number_matched:
+                raise RuntimeError(
+                    "WFS pagination ended before numberMatched features were returned"
+                )
             break
         start_index += len(page)
 
