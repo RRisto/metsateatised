@@ -38,6 +38,6 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -p no:terminalprogress"
 pythonpath = ["."]
 markers = ["live: queries public Forest Register endpoints"]

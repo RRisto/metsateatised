@@ -1,9 +1,9 @@
-from datetime import UTC, date, datetime
-from pathlib import Path
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime
+from pathlib import Path
 
 import geopandas as gpd
 import pytest
@@ -15,6 +15,7 @@ from notice_store import (
     is_partition_complete,
     partition_path,
     read_manifest,
+    rebuild_manifest,
     split_month_intervals,
     summarize_store,
     upsert_partition,
@@ -51,6 +52,54 @@ def test_read_manifest_returns_the_empty_store_document(tmp_path: Path):
     }
 
 
+def test_rebuild_manifest_recovers_existing_canonical_partitions(tmp_path: Path):
+    first_key = PartitionKey("archive_notices", 2025, 3)
+    second_key = PartitionKey("current_notices", 2025, 4)
+    first = notice_frame(
+        [
+            {
+                "teatis_id": 1,
+                "registreerimise_kp": "2025-03-08",
+                "_date_col": "registreerimise_kp",
+                "geometry": Point(24.0, 59.0),
+            }
+        ]
+    )
+    second = notice_frame(
+        [
+            {
+                "teatis_id": 2,
+                "registreerimise_kp": "2025-04-12",
+                "_date_col": "registreerimise_kp",
+                "geometry": Point(25.0, 58.0),
+            },
+            {
+                "teatis_id": 3,
+                "registreerimise_kp": "2025-04-30",
+                "_date_col": "registreerimise_kp",
+                "geometry": Point(26.0, 57.0),
+            },
+        ]
+    )
+    upsert_partition(tmp_path, first_key, first, identity_candidates=["teatis_id"])
+    upsert_partition(tmp_path, second_key, second, identity_candidates=["teatis_id"])
+    (tmp_path / "manifest.json").unlink()
+    stray = tmp_path / "archive_notices" / "year=2025" / "month=03" / "partial.parquet"
+    first.to_parquet(stray)
+
+    rebuilt = rebuild_manifest(tmp_path, identity_candidates=["teatis_id"])
+
+    assert set(rebuilt["partitions"]) == {
+        "archive_notices/2025-03",
+        "current_notices/2025-04",
+    }
+    assert rebuilt["partitions"]["archive_notices/2025-03"]["record_count"] == 1
+    assert rebuilt["partitions"]["current_notices/2025-04"]["record_count"] == 2
+    assert rebuilt["partitions"]["archive_notices/2025-03"]["observed_start"] == "2025-03-08"
+    assert rebuilt["partitions"]["current_notices/2025-04"]["observed_end"] == "2025-04-30"
+    assert read_manifest(tmp_path) == rebuilt
+
+
 def test_upsert_partition_deduplicates_and_prefers_new_rows(tmp_path: Path):
     key = PartitionKey("archive_notices", 2025, 3)
     first = notice_frame(
@@ -77,6 +126,22 @@ def test_upsert_partition_deduplicates_and_prefers_new_rows(tmp_path: Path):
         {"teatis_id": 3, "otsus": "added"},
     ]
     assert is_partition_complete(tmp_path, key)
+
+
+def test_upsert_partition_accepts_relative_store_root(tmp_path: Path, monkeypatch):
+    """A relative configured root must work when temporary paths are absolute."""
+    monkeypatch.chdir(tmp_path)
+    root = Path("data/notices")
+    key = PartitionKey("archive_notices", 2025, 3)
+    incoming = notice_frame(
+        [{"teatis_id": 1, "otsus": "new", "geometry": Point(24.0, 59.0)}]
+    )
+
+    count = upsert_partition(root, key, incoming, identity_candidates=["teatis_id"])
+
+    assert count == 1
+    assert partition_path(root, key).exists()
+    assert (root / "manifest.json").exists()
 
 
 def test_upsert_failure_preserves_existing_partition_and_manifest(tmp_path: Path, monkeypatch):
@@ -351,6 +416,19 @@ raise SystemExit(24)
         assert (tmp_path / ".notice-store.lock").exists()
 
     assert not (tmp_path / ".notice-store.lock").exists()
+
+
+def test_windows_invalid_pid_is_not_treated_as_running(monkeypatch):
+    """Windows reports a dead PID through os.kill(pid, 0) as winerror 87."""
+
+    def invalid_parameter(pid, signal):
+        error = OSError(22, "The parameter is incorrect")
+        error.winerror = 87
+        raise error
+
+    monkeypatch.setattr(notice_store.os, "kill", invalid_parameter)
+
+    assert notice_store._process_is_running(3048) is False
 
 
 def test_summarize_store_uses_completed_manifest_entries(tmp_path: Path):

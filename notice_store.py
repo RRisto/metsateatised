@@ -5,7 +5,7 @@ import os
 import socket
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -85,8 +85,8 @@ def _process_is_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
-        return True
+    except OSError as error:
+        return getattr(error, "winerror", None) != 87
     return True
 
 
@@ -103,10 +103,8 @@ def _remove_stale_lock(lock_path: Path) -> bool:
         return False
     if _process_is_running(pid):
         return False
-    try:
+    with suppress(FileNotFoundError):
         lock_path.unlink()
-    except FileNotFoundError:
-        pass
     return True
 
 
@@ -136,7 +134,9 @@ def _store_lock(
             if _remove_stale_lock(lock_path):
                 continue
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for notice store lock: {lock_path}")
+                raise TimeoutError(
+                    f"timed out waiting for notice store lock: {lock_path}"
+                ) from None
             time.sleep(min(STORE_LOCK_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
             continue
         try:
@@ -224,6 +224,52 @@ def is_partition_complete(root: Path, key: PartitionKey) -> bool:
         manifest = _read_manifest_unlocked(root)
         entry = manifest.get("partitions", {}).get(_manifest_key(key), {})
         return entry.get("status") == "complete" and partition_path(root, key).exists()
+
+
+def rebuild_manifest(
+    root: Path,
+    *,
+    identity_candidates: Sequence[str],
+) -> dict:
+    """Rebuild the manifest from already-published canonical partitions."""
+    root = root.resolve()
+    with _store_lock(root):
+        _recover_pending_transaction(root)
+        partitions: dict[str, dict] = {}
+        sync_times: list[datetime] = []
+
+        for path in sorted(root.glob("*/year=*/month=*/notices.parquet")):
+            try:
+                layer = path.parents[2].name
+                year = int(path.parents[1].name.removeprefix("year="))
+                month = int(path.parent.name.removeprefix("month="))
+                key = PartitionKey(layer, year, month)
+            except ValueError as error:
+                raise ValueError(f"invalid notice partition path: {path}") from error
+            if not 1 <= month <= 12 or partition_path(root, key) != path:
+                raise ValueError(f"invalid notice partition path: {path}")
+
+            frame = _to_wgs84(_read_partition(path))
+            observed_start, observed_end = _observed_bounds(frame)
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+            sync_times.append(updated_at)
+            partitions[_manifest_key(key)] = {
+                "status": "complete",
+                "record_count": len(frame),
+                "identity_field": _identity_field(None, frame, identity_candidates),
+                "observed_start": observed_start,
+                "observed_end": observed_end,
+                "schema_fingerprint": _schema_fingerprint(frame),
+                "updated_at": updated_at.isoformat(),
+            }
+
+        manifest = {
+            "format_version": 1,
+            "last_sync_at": max(sync_times).isoformat() if sync_times else None,
+            "partitions": partitions,
+        }
+        _write_manifest(root, manifest)
+        return manifest
 
 
 def _to_wgs84(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -377,6 +423,7 @@ def upsert_partition(
     now: datetime | None = None,
 ) -> int:
     """Merge new notice rows into one durable monthly partition."""
+    root = root.resolve()
     with _store_lock(root):
         _recover_pending_transaction(root)
         destination = partition_path(root, key)

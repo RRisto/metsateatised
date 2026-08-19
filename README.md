@@ -70,6 +70,33 @@ biomassi arvutamine ning ühine suuremahuline visualiseerimine on eraldi töö j
 ei käivitu selle toiminguga. Lühiajalise `data/cache` kustutamine ei kustuta
 püsivat metsateatiste andmehoidlat `data/notices`.
 
+## Kümne aasta andmete eeltöötlus
+
+Olemasolevate toorpartitsioonide eraldistega sidumiseks ja biomassi arvutamiseks käivita:
+
+```powershell
+.venv\Scripts\python.exe preprocess_notices.py
+```
+
+Käsk ei laadi metsateatisi uuesti ega muuda `data/notices` sisu. See küsib võrgust ainult
+eraldised ja nende detailid ning avaldab iga valmis kalendrikuu eraldi teedele
+`data/processed/notices/year=YYYY/month=MM/`. Töö võib katkestada ja sama käsuga jätkata;
+valmis kuud jäetakse vahele.
+
+Ühe kuu proovikäivitus:
+
+```powershell
+.venv\Scripts\python.exe preprocess_notices.py --start 2016-08 --end 2016-08
+```
+
+Uuesti arvutamiseks kasuta `--force`. Detailpäringute vaikimisi paralleelsus on 12 ja seda saab
+muuta valikuga `--detail-workers`. Võrguveaga kuu raporteeritakse, järgmiste kuude töötlemine
+jätkub ning käsu väljumiskood on vea korral 1.
+
+Valmis andmeid saab uurida märkmikus `notebooks/notice_exploration.ipynb`. Laadurid
+`load_processed_notices` ja `load_processed_species` loevad ainult manifestis valminuks märgitud
+kuud ning toetavad kuuvahemikku ja veergude projektsiooni.
+
 ## Andmeallikad
 
 Metsaregistri GeoServer WFS:

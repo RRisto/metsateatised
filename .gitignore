@@ -3,4 +3,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/cache/
+data/notices/
+data/processed/
+pytest-*.out
+pytest-*.err
+pytest-output.txt
+preprocess-*.out
+preprocess-*.err
 .worktrees/
